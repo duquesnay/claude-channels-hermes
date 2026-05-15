@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-channels-hermes",
+  "description": "Local marketplace for the Hermes channel plugin (IPC bridge between Hermes daemon and claude --channels).",
+  "owner": {"name": "guillaume"},
+  "plugins": [
+    {
+      "name": "hermes-channel",
+      "description": "IPC bridge between Hermes daemon and claude --channels.",
+      "category": "messaging",
+      "source": "./external_plugins/hermes-channel"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "hermes-channel",
+  "description": "IPC bridge between Hermes daemon and claude --channels. Exposes reply_open/reply_chunk/reply_close tools; routes responses back to Hermes via Unix socket.",
+  "version": "0.1.0",
+  "keywords": ["hermes", "ipc", "channel", "mcp"]
+}
