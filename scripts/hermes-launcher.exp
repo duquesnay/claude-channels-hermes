@@ -1,0 +1,34 @@
+#!/usr/bin/env expect -f
+
+# Launcher for claude --channels hermes session.
+# Manual test runner (not launchd-managed yet — Phase 2).
+# Allocates a pty, dismisses the dev-channels confirmation prompt,
+# then streams until claude exits.
+#
+# Usage:
+#   ./scripts/hermes-launcher.exp
+#
+# Requires:
+#   - hermes-channel@claude-channels-hermes plugin installed
+#   - bun available in PATH
+
+set timeout -1
+log_user 1
+
+cd /Users/guillaume/dev/nestor/claude-channels-hermes
+
+spawn /Users/guillaume/.local/bin/claude \
+    --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+    --name claude_hermes_test \
+    --permission-mode auto \
+    --model haiku \
+    --allowedTools "mcp__plugin_hermes-channel_hermes-channel__*"
+
+# Dismiss the dev-channels TUI confirmation prompt.
+# Two blind Enter sends, robust against prompt-text changes.
+sleep 3
+send "\r"
+sleep 3
+send "\r"
+
+expect eof
