@@ -1,0 +1,40 @@
+#!/usr/bin/env expect -f
+#
+# Spike launcher: claude --channels with hermes-channel-spike plugin.
+# Uses a separate socket (hermes-channel-spike.sock) to avoid touching the live session.
+#
+# Usage:
+#   ./spikes/multimodal/spike-launcher.exp [VARIANT]
+#
+# MULTIMODAL_VARIANT=1 (default): MCP-style image parts
+# MULTIMODAL_VARIANT=2: Anthropic-style source blocks
+# MULTIMODAL_VARIANT=3: sidecar content_parts
+#
+# Requires: hermes-channel-spike@hermes-channel-spike-marketplace installed
+
+set variant [lindex $argv 0]
+if {$variant eq ""} { set variant "1" }
+
+set timeout -1
+log_user 1
+
+cd /Users/guillaume/dev/nestor/claude-channels-hermes
+
+# Set the spike socket and variant via env
+set env(HERMES_CHANNEL_SOCKET) "/Users/guillaume/.hermes/run/hermes-channel-spike.sock"
+set env(MULTIMODAL_VARIANT) $variant
+
+spawn /Users/guillaume/.local/bin/claude \
+    --dangerously-load-development-channels plugin:hermes-channel-spike@hermes-channel-spike-marketplace \
+    --name claude_hermes_spike \
+    --permission-mode auto \
+    --model sonnet \
+    --allowedTools "mcp__plugin_hermes-channel-spike_hermes-channel-spike__*"
+
+# Dismiss the dev-channels TUI confirmation prompt (two Enter presses)
+sleep 3
+send "\r"
+sleep 3
+send "\r"
+
+expect eof
