@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hermes-channel-spike": {
+      "command": "bun",
+      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"],
+      "env": {
+        "HERMES_CHANNEL_SOCKET": "${HOME}/.hermes/run/hermes-channel-spike.sock",
+        "MULTIMODAL_VARIANT": "1"
+      }
+    }
+  }
+}

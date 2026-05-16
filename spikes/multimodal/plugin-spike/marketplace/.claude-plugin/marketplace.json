@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "hermes-channel-spike-marketplace",
+  "description": "Spike-only marketplace for multimodal hermes-channel testing.",
+  "owner": {"name": "guillaume"},
+  "plugins": [
+    {
+      "name": "hermes-channel-spike",
+      "description": "Multimodal spike of IPC bridge between Hermes daemon and claude --channels.",
+      "category": "messaging",
+      "source": "./external_plugins/hermes-channel-spike"
+    }
+  ]
+}

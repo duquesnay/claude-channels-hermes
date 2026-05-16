@@ -1,0 +1,6 @@
+{
+  "name": "hermes-channel-spike",
+  "description": "Multimodal spike: IPC bridge with image support via notifications/claude/channel. Spike-only, not for production.",
+  "version": "0.1.0-spike",
+  "keywords": ["hermes", "ipc", "channel", "mcp", "spike", "multimodal"]
+}
