@@ -1,28 +1,47 @@
 #!/usr/bin/env expect -f
 
 # Launcher for claude --channels hermes session.
-# Manual test runner (not launchd-managed yet — Phase 2).
+# Manual test runner (NOT launchd-managed — janet-test is a test app).
+# Only prod Janet would warrant a launchd plist.
+#
 # Allocates a pty, dismisses the dev-channels confirmation prompt,
-# then streams until claude exits.
+# then streams until claude exits. Logs append, never overwrite.
 #
 # Usage:
 #   ./scripts/hermes-launcher.exp
 #
+# Logs:
+#   /Users/guillaume/dev/nestor/claude-channels-hermes/logs/session.log
+#     — full TUI stdout (append mode, kept across crashes)
+#   /Users/guillaume/dev/nestor/claude-channels-hermes/logs/session.crash.log
+#     — exit signature + last 50 lines of TUI at death time
+#
 # Requires:
 #   - hermes-channel@claude-channels-hermes plugin installed
 #   - bun available in PATH
+#   - Read tool whitelisted so the auxiliary shim can ask Claude to
+#     load /tmp/janet-img-*.png via native Read (vision relay)
 
 set timeout -1
 log_user 1
 
 cd /Users/guillaume/dev/nestor/claude-channels-hermes
 
+# Persistent log dir + boot stamp (crash forensics — losing this is what
+# made the previous orphan-death investigation a guessing game).
+exec mkdir -p logs
+set boot_ts [exec date "+%Y-%m-%dT%H:%M:%S%z"]
+exec sh -c "printf '\\n=== BOOT %s pid=%d ===\\n' '$boot_ts' [pid] >> logs/session.log"
+
+# Append-mode logging via `expect log_file -a`.
+log_file -a logs/session.log
+
 spawn /Users/guillaume/.local/bin/claude \
     --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
     --name claude_hermes_test \
     --permission-mode auto \
     --model haiku \
-    --allowedTools "mcp__plugin_hermes-channel_hermes-channel__*"
+    --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
 
 # Dismiss the dev-channels TUI confirmation prompt.
 # Two blind Enter sends, robust against prompt-text changes.
@@ -32,3 +51,14 @@ sleep 3
 send "\r"
 
 expect eof
+
+# Crash forensics: when claude exits, capture the exit code + write a
+# crash entry pointing at the same session.log so the next investigation
+# has a starting point.
+set exit_ts [exec date "+%Y-%m-%dT%H:%M:%S%z"]
+catch {wait} wait_result
+exec sh -c "{
+  printf '=== EXIT %s pid=%d wait=%s ===\\n' '$exit_ts' [pid] '$wait_result'
+  printf 'last 50 lines of session.log:\\n'
+  tail -n 50 logs/session.log
+} >> logs/session.crash.log"
