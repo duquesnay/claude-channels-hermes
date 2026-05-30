@@ -1,0 +1,22 @@
+#!/usr/bin/env expect -f
+# Launch the persistent claude --channels session for the ACP supervisor.
+# The --name claude_hermes_acp is used by supervisor.ts for:
+#   - process detection (reuse vs launch decision)
+#   - shutdown (pkill -f claude_hermes_acp)
+# PTY is required so claude can receive the dev-channels confirmation.
+# Two blind Enters dismiss the TUI prompt robustly (no-op if not shown).
+set timeout -1
+log_user 1
+cd /Users/guillaume/dev/nestor/claude-channels-hermes
+spawn /Users/guillaume/.local/bin/claude \
+    --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+    --name claude_hermes_acp \
+    --permission-mode auto \
+    --model haiku \
+    --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+# Dismiss the dev-channels TUI confirmation (two blind Enters, robust no-op otherwise).
+sleep 4
+send "\r"
+sleep 3
+send "\r"
+expect eof
