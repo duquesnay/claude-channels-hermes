@@ -1,22 +1,40 @@
 #!/usr/bin/env expect -f
-# Launch the persistent claude --channels session for the ACP supervisor.
-# The --name claude_hermes_acp is used by supervisor.ts for:
-#   - process detection (reuse vs launch decision)
-#   - shutdown (pkill -f claude_hermes_acp)
-# PTY is required so claude can receive the dev-channels confirmation.
-# Two blind Enters dismiss the TUI prompt robustly (no-op if not shown).
+# Launch a persistent claude --channels session for the ACP session pool.
+#
+# Parameterized via environment variables (injected by session_pool.ts):
+#   HERMES_CHANNEL_SOCKET   Socket path for the hermes-channel plugin to bind.
+#                           Propagates to the plugin bun child via parent env
+#                           (voie a — proven in spike 2026-06-14: no --strict-mcp-config).
+#   HERMES_SESSION_NAME     The --name for the claude process (claude_hermes_<hash8>).
+#                           Scoped per session_key — used for targeted kill on eviction.
+#   HERMES_SESSION_CWD      Working directory for the claude session.
+#
+# PTY is required so claude can receive the dev-channels TUI confirmation.
+# Two blind Enters dismiss the TUI prompt (no-op if not shown).
+#
+# NEVER use --strict-mcp-config: it suppresses the hermes-channel plugin entirely.
+
 set timeout -1
 log_user 1
-cd /Users/guillaume/dev/nestor/claude-channels-hermes
+
+# Resolve parameters from environment, with safe defaults.
+set socket_path [expr { [info exists env(HERMES_CHANNEL_SOCKET)] ? $env(HERMES_CHANNEL_SOCKET) : "" }]
+set session_name [expr { [info exists env(HERMES_SESSION_NAME)] ? $env(HERMES_SESSION_NAME) : "claude_hermes_acp" }]
+set session_cwd [expr { [info exists env(HERMES_SESSION_CWD)] ? $env(HERMES_SESSION_CWD) : [pwd] }]
+
+cd $session_cwd
+
 spawn /Users/guillaume/.local/bin/claude \
     --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
-    --name claude_hermes_acp \
+    --name $session_name \
     --permission-mode auto \
     --model haiku \
     --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+
 # Dismiss the dev-channels TUI confirmation (two blind Enters, robust no-op otherwise).
 sleep 4
 send "\r"
 sleep 3
 send "\r"
+
 expect eof
