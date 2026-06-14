@@ -1,11 +1,15 @@
 /**
- * acp_server.ts — ACP Agent implementation that bridges to a hermes-channel session.
+ * acp_server.ts — ACP Agent implementation backed by a ChannelsSessionPool.
  *
- * Implements the Agent interface from @agentclientprotocol/sdk for use with
- * AgentSideConnection. A single shared HermesChannelClient is used for all
- * sessions — the live claude --channels session maintains its own transcript.
- * Janet inlines full conversation context per turn, so no per-session subprocess
- * is needed on the backend.
+ * Each ACP session maps to a `session_key` supplied by Janet in
+ * `_meta["hermes.channels/session_key"]`. The pool owns one persistent
+ * claude --channels process per session_key.
+ *
+ * Generation token (linchpin):
+ *   - newSession → _meta.session_generation = state.generation (creation nonce)
+ *   - prompt → _meta.session_generation = state.generation (current nonce, EVERY turn)
+ *   The nonce changes on every pool respawn, letting Hermes detect stale
+ *   in-session state and switch from DELTA to CATCH-UP mode.
  *
  * Fix C (SDK 0.22.1): `authenticate` is REQUIRED (not optional) on Agent.
  * closeSession is optional in the type but implemented for session hygiene.
@@ -28,19 +32,19 @@ import type {
   CancelNotification,
   CloseSessionRequest,
 } from "@agentclientprotocol/sdk";
-import type { HermesChannelClientInterface } from "./hermes_channel_client.ts";
+import { ChannelsSessionPool, PoolFullError } from "./session_pool.ts";
+import { randomUUID } from "node:crypto";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Default per-turn timeout in milliseconds. */
 const DEFAULT_TURN_TIMEOUT_MS = 120_000;
 
-// ---------------------------------------------------------------------------
-// Injectable client interface (for unit testing)
-// ---------------------------------------------------------------------------
-
-export interface AgentDeps {
-  /** Shared client to the hermes-channel socket. Injected for tests. */
-  client: HermesChannelClientInterface;
-}
+/**
+ * ACP _meta key used by Janet to supply the session key.
+ * Python side: `_meta["hermes.channels/session_key"]`
+ */
+const SESSION_KEY_META = "hermes.channels/session_key";
 
 // ---------------------------------------------------------------------------
 // ClaudeAgent
@@ -48,12 +52,11 @@ export interface AgentDeps {
 
 class ClaudeAgent implements Agent {
   private readonly connection: AgentSideConnection;
-  private readonly client: HermesChannelClientInterface;
-  private readonly sessions = new Set<string>();
+  private readonly pool: ChannelsSessionPool;
 
-  constructor(connection: AgentSideConnection, deps: AgentDeps) {
+  constructor(connection: AgentSideConnection, pool: ChannelsSessionPool) {
     this.connection = connection;
-    this.client = deps.client;
+    this.pool = pool;
   }
 
   // --------------------------------------------------------------------------
@@ -70,35 +73,89 @@ class ClaudeAgent implements Agent {
   }
 
   // --------------------------------------------------------------------------
-  // authenticate — required by SDK 0.22.1 (not optional)
+  // authenticate — required by SDK 0.22.1
   // --------------------------------------------------------------------------
 
   async authenticate(_params: AuthenticateRequest): Promise<AuthenticateResponse> {
-    // No authentication required — return empty response per spec example.
     return {} as AuthenticateResponse;
   }
 
   // --------------------------------------------------------------------------
-  // newSession — register a UUID session (no per-session backend resource)
+  // newSession — extract session_key, warm the pool slot, emit generation token
   // --------------------------------------------------------------------------
 
-  async newSession(_params: NewSessionRequest): Promise<NewSessionResponse> {
-    const sessionId = generateUuid();
-    this.sessions.add(sessionId);
-    return { sessionId };
+  async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
+    const acpSessionId = randomUUID();
+
+    // Extract session_key from Janet's _meta; fallback to a UUID for non-Janet clients.
+    const meta = (params as Record<string, unknown>)["_meta"] as
+      | Record<string, unknown>
+      | undefined;
+    const sessionKey =
+      (meta?.[SESSION_KEY_META] as string | undefined) ?? randomUUID();
+
+    // Register ACP ↔ session_key mapping before getOrCreate so prompt routing
+    // works even if getOrCreate throws (mapping will be cleaned on closeSession).
+    this.pool.registerAcpSession(acpSessionId, sessionKey);
+
+    let generation: string;
+    try {
+      const state = await this.pool.getOrCreate(sessionKey);
+      generation = state.generation;
+    } catch (err) {
+      this.pool.unregisterAcpSession(acpSessionId);
+      if (err instanceof PoolFullError) {
+        // Structured refusal — return a session but indicate stopReason refusal
+        // on the next prompt. ACP doesn't have a newSession rejection,
+        // so we return a session and let prompt return stopReason:"refusal".
+        process.stderr.write(`acp-server: pool full, deferring refusal to prompt for ${acpSessionId}\n`);
+        this.pool.registerAcpSession(acpSessionId, `__refused__${acpSessionId}`);
+        return { sessionId: acpSessionId };
+      }
+      throw err;
+    }
+
+    process.stderr.write(
+      `acp-server: newSession acp=${acpSessionId} key=${sessionKey} gen=${generation}\n`
+    );
+
+    return {
+      sessionId: acpSessionId,
+      // Generation token: consumed by Hermes to detect session respawns.
+      // Python: prompt_result["_meta"]["session_generation"]
+      _meta: { session_generation: generation },
+    } as NewSessionResponse & { _meta: Record<string, unknown> };
   }
 
   // --------------------------------------------------------------------------
-  // prompt — forward to hermes-channel, emit result as agent_message_chunk
+  // prompt — route to pool client, emit generation token on EVERY turn
   // --------------------------------------------------------------------------
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     const { sessionId, prompt: contentBlocks } = params;
-    if (!this.sessions.has(sessionId)) {
-      throw new Error(`Session ${sessionId} not found`);
+
+    const sessionKey = this.pool.sessionKeyForAcp(sessionId);
+    if (!sessionKey) {
+      throw new Error(`acp-server: ACP session ${sessionId} not found`);
     }
 
-    // Extract text from ContentBlock array
+    // Refused sessions (pool full at newSession time).
+    if (sessionKey.startsWith("__refused__")) {
+      return { stopReason: "refusal" };
+    }
+
+    // Re-fetch the state — may have respawned since newSession (generates new nonce).
+    let state;
+    try {
+      state = await this.pool.getOrCreate(sessionKey);
+    } catch (err) {
+      if (err instanceof PoolFullError) {
+        return { stopReason: "refusal" };
+      }
+      throw err;
+    }
+
+    // Extract text from ContentBlock array.
     const promptText = contentBlocks
       .filter((b) => b.type === "text")
       .map((b) => (b as { type: "text"; text: string }).text)
@@ -106,15 +163,17 @@ class ClaudeAgent implements Agent {
 
     let content: string;
     try {
-      content = await this.client.sendPrompt(promptText, DEFAULT_TURN_TIMEOUT_MS);
+      content = await state.client.sendPrompt(promptText, DEFAULT_TURN_TIMEOUT_MS);
     } catch (err) {
       process.stderr.write(
-        `hermes-channel-client: prompt failed for session ${sessionId}: ${err}\n`
+        `acp-server: prompt failed for session ${sessionId}: ${err}\n`
       );
-      return { stopReason: "refusal" };
+      return { stopReason: "refusal" } as PromptResponse;
+    } finally {
+      this.pool.release(sessionKey);
     }
 
-    // Emit accumulated text as a single agent_message_chunk
+    // Emit accumulated text as a single agent_message_chunk.
     if (content) {
       await this.connection.sessionUpdate({
         sessionId,
@@ -128,25 +187,28 @@ class ClaudeAgent implements Agent {
       });
     }
 
-    return { stopReason: "end_turn" };
+    // Generation token returned on EVERY turn — Hermes reads this to detect
+    // respawns between turns. state.generation is the current nonce.
+    return {
+      stopReason: "end_turn",
+      _meta: { session_generation: state.generation },
+    } as PromptResponse & { _meta: Record<string, unknown> };
   }
 
   // --------------------------------------------------------------------------
-  // cancel — no per-session subprocess to kill on the hermes-channel backend
+  // cancel — drop the ACP mapping (pool slot is retained for other sessions)
   // --------------------------------------------------------------------------
 
   async cancel(params: CancelNotification): Promise<void> {
-    // The shared client is multiplexed; cancelling one session cannot abort
-    // other in-flight requests. Just drop the session record.
-    this.sessions.delete(params.sessionId);
+    this.pool.unregisterAcpSession(params.sessionId);
   }
 
   // --------------------------------------------------------------------------
-  // closeSession — remove the session record (no backend resource to release)
+  // closeSession — clean up ACP mapping (pool slot retained until idle eviction)
   // --------------------------------------------------------------------------
 
   async closeSession(params: CloseSessionRequest): Promise<void> {
-    this.sessions.delete(params.sessionId);
+    this.pool.unregisterAcpSession(params.sessionId);
   }
 }
 
@@ -157,26 +219,21 @@ class ClaudeAgent implements Agent {
 /**
  * Create an Agent instance for the given AgentSideConnection.
  *
- * deps.client is the shared HermesChannelClient — inject a mock in tests.
- *
- * @param conn - The AgentSideConnection from the SDK.
- * @param deps - Injectable dependencies (required: client).
+ * @param conn  The AgentSideConnection from the SDK.
+ * @param pool  The shared ChannelsSessionPool (inject a mock in tests).
  */
-export function createAgent(conn: AgentSideConnection, deps: AgentDeps): Agent {
-  return new ClaudeAgent(conn, deps);
+export function createAgent(
+  conn: AgentSideConnection,
+  pool: ChannelsSessionPool
+): Agent {
+  return new ClaudeAgent(conn, pool);
 }
 
-// ---------------------------------------------------------------------------
-// UUID generation (crypto API — no external dependency)
-// ---------------------------------------------------------------------------
-
-function generateUuid(): string {
-  return Array.from(crypto.getRandomValues(new Uint8Array(16)))
-    .map((b, i) => {
-      if (i === 6) b = (b & 0x0f) | 0x40;
-      if (i === 8) b = (b & 0x3f) | 0x80;
-      return b.toString(16).padStart(2, "0");
-    })
-    .join("")
-    .replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+/**
+ * Resolve the path to launcher.exp relative to this file's directory.
+ * Used by acp_entrypoint.ts to create the pool.
+ */
+export function resolveLauncherExpPath(): string {
+  const thisDir = dirname(fileURLToPath(import.meta.url));
+  return join(thisDir, "..", "launcher.exp");
 }
