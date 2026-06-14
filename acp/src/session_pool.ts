@@ -120,6 +120,15 @@ export interface PoolDeps {
    * Injected so tests with synthetic PIDs can return true/false deterministically.
    */
   isPidAlive(pid: number): boolean;
+
+  /**
+   * Last-resort pkill by session name pattern (MUST be the scoped name,
+   * e.g. "claude_hermes_<hash8>", never the bare "claude_hermes" generic).
+   * Called only if the process is still detectable after killPid + killSocketHolders.
+   * Injected so tests can assert the exact pattern and confirm it was called
+   * only when necessary (or not called when earlier steps sufficed).
+   */
+  killByName(sessionName: string): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +204,14 @@ function defaultKillSocketHolders(socketPath: string): void {
   }
 }
 
+function defaultKillByName(sessionName: string): void {
+  // Scoped last-resort: sessionName MUST be "claude_hermes_<hash8>".
+  // Never called with the generic "claude_hermes" pattern.
+  Bun.spawnSync(["pkill", "-f", sessionName], { stdout: "pipe", stderr: "pipe" });
+  process.stderr.write(`session-pool: pkill -f ${sessionName} (last resort)
+`);
+}
+
 function defaultIsPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -211,6 +228,7 @@ const PRODUCTION_DEPS: PoolDeps = {
   killSocketHolders: defaultKillSocketHolders,
   now: () => Date.now(),
   isPidAlive: defaultIsPidAlive,
+  killByName: defaultKillByName,
 };
 
 // ---------------------------------------------------------------------------
@@ -441,12 +459,10 @@ export class ChannelsSessionPool {
     // Brief wait for graceful termination.
     await new Promise<void>((r) => setTimeout(r, 500));
 
-    // 3. Last resort: pkill -f "<sessionName>" — SCOPED to hash suffix.
-    // NEVER called with a generic "claude_hermes" pattern.
-    Bun.spawnSync(["pkill", "-f", state.sessionName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    // 3. Last resort: pkill by scoped session name.
+    // sessionName is always "claude_hermes_<hash8>" — never the bare generic.
+    // Injected via deps so tests can assert the exact name pattern.
+    this.deps.killByName(state.sessionName);
 
     // Close the client.
     try { state.client.close(); } catch { /* ignore */ }

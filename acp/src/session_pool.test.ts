@@ -136,6 +136,7 @@ async function makePool(opts: {
     },
     now() { return nowValue.value; },
     isPidAlive(_pid) { return true; }, // synthetic PIDs are always "alive" in tests
+    killByName(_name) {}, // no-op in tests; pattern asserted separately
   };
 
   const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -267,6 +268,7 @@ describe("generation token on respawn", () => {
       killSocketHolders(_socketPath) {},
       now() { return Date.now(); },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -346,6 +348,7 @@ describe("capacity cap", () => {
       killSocketHolders(_socketPath) {},
       now() { return Date.now(); },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -389,6 +392,7 @@ describe("capacity cap", () => {
       killSocketHolders(_socketPath) {},
       now() { return Date.now(); },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -433,6 +437,7 @@ describe("graceful drain on evict", () => {
       killSocketHolders(_socketPath) {},
       now() { return Date.now(); },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -477,6 +482,7 @@ describe("scoped kill assertion", () => {
       killSocketHolders(_socketPath) {},
       now() { return Date.now(); },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -502,6 +508,43 @@ describe("scoped kill assertion", () => {
     // — NOT the bare "claude_hermes" generic pattern
     expect(state.sessionName).toMatch(/^claude_hermes_[0-9a-f]{8}$/);
     await fake.cleanup();
+  });
+
+  it("killByName is called with exact scoped name, never generic pattern", async () => {
+    const killByNameCalls: string[] = [];
+    const fakeServers = new Map<string, Server>();
+    const EXPECTED_PID = 54322;
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return EXPECTED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(name) { killByNameCalls.push(name); },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("generic-kill-test");
+    await pool.evict("generic-kill-test", false);
+
+    // killByName MUST have been called
+    expect(killByNameCalls.length).toBeGreaterThanOrEqual(1);
+    // Every call MUST use the scoped hash name — NEVER bare "claude_hermes"
+    for (const name of killByNameCalls) {
+      expect(name).toMatch(/^claude_hermes_[0-9a-f]{8}$/);
+      expect(name).not.toBe("claude_hermes");
+      expect(name).not.toBe("claude_hermes_acp");
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
   });
 
   // Satisfy TypeScript — afterEach reference
@@ -541,6 +584,7 @@ describe("idle eviction", () => {
       killSocketHolders(_socketPath) {},
       now() { return nowValue.value; },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
@@ -580,6 +624,7 @@ describe("idle eviction", () => {
       killSocketHolders(_socketPath) {},
       now() { return nowValue.value; },
       isPidAlive(_pid) { return true; },
+      killByName(_name) {},
     };
 
     const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
