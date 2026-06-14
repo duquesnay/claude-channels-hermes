@@ -26,6 +26,8 @@ import { randomUUID } from "crypto";
 export interface HermesChannelClientInterface {
   sendPrompt(content: string, timeoutMs: number): Promise<string>;
   close(): void;
+  /** Number of in-flight requests waiting for a response. Used by graceful drain. */
+  get pendingCount(): number;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,15 @@ export class HermesChannelClient implements HermesChannelClientInterface {
   private connectPromise: Promise<void> | null = null;
   private readonly pending = new Map<string, PendingEntry>();
   private readBuffer = "";
+
+  // --------------------------------------------------------------------------
+  // pendingCount — observable for graceful drain
+  // --------------------------------------------------------------------------
+
+  /** Number of in-flight requests waiting for a response. */
+  get pendingCount(): number {
+    return this.pending.size;
+  }
 
   constructor(socketPath?: string) {
     this.socketPath = socketPath ?? resolveSocketPath();
