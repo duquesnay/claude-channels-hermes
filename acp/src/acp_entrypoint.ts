@@ -1,16 +1,14 @@
 /**
- * acp_entrypoint.ts — stdio ACP server entry point with supervisor lifecycle.
+ * acp_entrypoint.ts — stdio ACP server entry point with session pool lifecycle.
  *
  * On startup:
- *   1. Runs the supervisor: launches (or reuses) the claude --channels session
- *      and waits for the hermes-channel Unix socket to be ready (~75s budget).
- *   2. Connects the shared HermesChannelClient to that socket.
+ *   1. Instantiates the ChannelsSessionPool (lazy — sessions spawn on first use).
+ *   2. Starts the idle-eviction loop.
  *   3. Starts serving ACP over stdin/stdout.
  *
  * On SIGTERM:
- *   - Calls supervisor.shutdown() (async, awaited) to clean up the session.
- *   - Closes the hermes-channel client.
- *   - Exits cleanly.
+ *   - pool.shutdown() drains all sessions and kills their processes (scoped).
+ *   - process.exit(0)
  *
  * ALL logging goes to STDERR — a single stray byte on stdout before
  * the connection is established wedges Janet's NDJSON reader.
@@ -26,42 +24,25 @@
 
 import { Readable, Writable } from "node:stream";
 import { ndJsonStream, AgentSideConnection } from "@agentclientprotocol/sdk";
-import { createAgent } from "./acp_server.ts";
-import { HermesChannelClient } from "./hermes_channel_client.ts";
-import { ensureSession, shutdown, resolveSocketPath } from "./supervisor.ts";
+import { createAgent, resolveLauncherExpPath } from "./acp_server.ts";
+import { ChannelsSessionPool } from "./session_pool.ts";
 
 // ---------------------------------------------------------------------------
-// Startup: supervisor first, then ACP
+// Instantiate the session pool (sessions spawn lazily on first getOrCreate)
 // ---------------------------------------------------------------------------
 
-const socketPath = resolveSocketPath();
-
-process.stderr.write("claude-channels-acp-server: starting supervisor...\n");
-try {
-  await ensureSession(socketPath);
-} catch (err) {
-  process.stderr.write(
-    `claude-channels-acp-server: supervisor failed to start: ${err}\n`
-  );
-  process.exit(1);
-}
-
-// ---------------------------------------------------------------------------
-// Shared hermes-channel client (one socket, multiplexed across all sessions)
-// ---------------------------------------------------------------------------
-
-const client = new HermesChannelClient(socketPath);
+const launcherExpPath = resolveLauncherExpPath();
+const pool = new ChannelsSessionPool(launcherExpPath);
+pool.startIdleEviction();
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 
 process.on("SIGTERM", () => {
-  // Must be async — shutdown kills processes and waits for them.
   void (async () => {
-    process.stderr.write("claude-channels-acp-server: SIGTERM received, shutting down...\n");
-    await shutdown(socketPath);
-    client.close();
+    process.stderr.write("claude-channels-acp-server: SIGTERM received, shutting down pool...\n");
+    await pool.shutdown();
     process.exit(0);
   })();
 });
@@ -70,7 +51,7 @@ process.on("SIGTERM", () => {
 // Start the ACP server
 // ---------------------------------------------------------------------------
 
-process.stderr.write("claude-channels-acp-server: ready\n");
+process.stderr.write("claude-channels-acp-server: ready (lazy session pool)\n");
 
 const stream = ndJsonStream(
   Writable.toWeb(process.stdout), // write sink (agent → client)
@@ -78,6 +59,6 @@ const stream = ndJsonStream(
 );
 
 new AgentSideConnection(
-  (conn) => createAgent(conn, { client }),
+  (conn) => createAgent(conn, pool),
   stream
 );
