@@ -24,15 +24,30 @@ log_user 1
 # in spike 2026-06-14). No --strict-mcp-config so the plugin actually starts.
 set session_name [expr { [info exists env(HERMES_SESSION_NAME)] ? $env(HERMES_SESSION_NAME) : "claude_hermes_acp" }]
 set session_cwd [expr { [info exists env(HERMES_SESSION_CWD)] ? $env(HERMES_SESSION_CWD) : [pwd] }]
+# Custom settings file (HERMES_CLAUDE_SETTINGS_FILE, same env var as claude_daemon):
+# a controlled allow-list + only the hermes MCP, EXCLUDING the user's private
+# plugins/connectors (context7, claude.ai Gmail/Drive/Notes...). Isolates the
+# session's toolset from ~/.claude without touching the account/HOME.
+set settings_file [expr { [info exists env(HERMES_CLAUDE_SETTINGS_FILE)] ? $env(HERMES_CLAUDE_SETTINGS_FILE) : "" }]
 
 cd $session_cwd
 
-spawn /Users/guillaume/.local/bin/claude \
-    --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
-    --name $session_name \
-    --permission-mode auto \
-    --model haiku \
-    --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+if {$settings_file ne ""} {
+    spawn /Users/guillaume/.local/bin/claude \
+        --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+        --name $session_name \
+        --permission-mode auto \
+        --model haiku \
+        --settings $settings_file \
+        --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+} else {
+    spawn /Users/guillaume/.local/bin/claude \
+        --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+        --name $session_name \
+        --permission-mode auto \
+        --model haiku \
+        --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+}
 
 # Dismiss the dev-channels TUI confirmation by matching the prompt as soon as it
 # appears (~725ms) instead of two blind sleeps (4s+3s). Spike 2026-06-15:
