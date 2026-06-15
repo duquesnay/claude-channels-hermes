@@ -38,6 +38,7 @@ if {$settings_file ne ""} {
         --name $session_name \
         --permission-mode auto \
         --model haiku \
+        --setting-sources project,local \
         --settings $settings_file \
         --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
 } else {
