@@ -29,6 +29,10 @@ set session_cwd [expr { [info exists env(HERMES_SESSION_CWD)] ? $env(HERMES_SESS
 # plugins/connectors (context7, claude.ai Gmail/Drive/Notes...). Isolates the
 # session's toolset from ~/.claude without touching the account/HOME.
 set settings_file [expr { [info exists env(HERMES_CLAUDE_SETTINGS_FILE)] ? $env(HERMES_CLAUDE_SETTINGS_FILE) : "" }]
+# Default = lean tool set (janet_test unchanged). Prod overrides via
+# HERMES_CLAUDE_ALLOWED_TOOLS to include its full plugin set (space-separated,
+# passed as a single string — same shape as the hardcoded default below).
+set allowed_tools [expr { [info exists env(HERMES_CLAUDE_ALLOWED_TOOLS)] && $env(HERMES_CLAUDE_ALLOWED_TOOLS) ne "" ? $env(HERMES_CLAUDE_ALLOWED_TOOLS) : "mcp__plugin_hermes-channel_hermes-channel__* Read" }]
 
 cd $session_cwd
 
@@ -40,14 +44,14 @@ if {$settings_file ne ""} {
         --model haiku \
         --setting-sources project,local \
         --settings $settings_file \
-        --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+        --allowedTools $allowed_tools
 } else {
     spawn /Users/guillaume/.local/bin/claude \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode auto \
         --model haiku \
-        --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
+        --allowedTools $allowed_tools
 }
 
 # Dismiss the dev-channels TUI confirmation by matching the prompt as soon as it
