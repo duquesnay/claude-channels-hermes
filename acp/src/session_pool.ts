@@ -385,7 +385,10 @@ export class ChannelsSessionPool {
     const expectPid = this.deps.spawnLauncher(this.launcherExpPath, {
       HERMES_CHANNEL_SOCKET: socketPath,
       HERMES_SESSION_NAME: sessionName,
-      HERMES_SESSION_CWD: process.cwd(),
+      // Persona/sandbox cwd: explicit env wins so the launcher cd's to the
+      // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
+      // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
+      HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
     });
 
     process.stderr.write(
