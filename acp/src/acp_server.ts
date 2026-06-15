@@ -205,6 +205,10 @@ class ClaudeAgent implements Agent {
     //   - no chunks streamed (streamedLength===0): emit full content as before
     //   - partial chunks: emit the remaining suffix
     //   - full coverage (streamedLength >= content.length): no duplicate emit
+    // Assumption: the streamed deltas are a strict prefix of finalText (the plugin
+    // passes full accumulated text to reply_close, so reply_close content always
+    // starts with everything reply_chunk already streamed). If the model rephrases
+    // rather than extends, this assumption breaks — but that would be a plugin bug.
     if (content && content.length > streamedLength) {
       const tail = content.slice(streamedLength);
       await this.connection.sessionUpdate({
