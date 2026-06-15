@@ -11,6 +11,16 @@
  *   The nonce changes on every pool respawn, letting Hermes detect stale
  *   in-session state and switch from DELTA to CATCH-UP mode.
  *
+ * Progressive streaming (V2):
+ *   prompt() passes an onChunk callback to sendPrompt that forwards each delta
+ *   as an agent_message_chunk session/update immediately as it arrives.
+ *   On the final "result", cumulative-length reconciliation is used to avoid
+ *   double-delivery: if finalText is longer than what was already streamed as
+ *   chunks, the tail is emitted as one more agent_message_chunk. If all content
+ *   was already streamed (streamed.length >= finalText.length), no extra emit.
+ *   This correctly handles: no chunks (full text emitted once as before),
+ *   partial chunks (tail appended), and complete coverage (no duplicate).
+ *
  * Fix C (SDK 0.22.1): `authenticate` is REQUIRED (not optional) on Agent.
  * closeSession is optional in the type but implemented for session hygiene.
  */
@@ -128,7 +138,7 @@ class ClaudeAgent implements Agent {
   }
 
   // --------------------------------------------------------------------------
-  // prompt — route to pool client, emit generation token on EVERY turn
+  // prompt — route to pool client, stream chunks, emit generation token
   // --------------------------------------------------------------------------
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
@@ -161,9 +171,26 @@ class ClaudeAgent implements Agent {
       .map((b) => (b as { type: "text"; text: string }).text)
       .join("");
 
+    // Accumulate streamed deltas for length-based tail reconciliation.
+    // Each delta forwarded by onChunk is immediately emitted as agent_message_chunk.
+    let streamedLength = 0;
+    const onChunk = async (delta: string): Promise<void> => {
+      streamedLength += delta.length;
+      await this.connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: delta,
+          },
+        },
+      });
+    };
+
     let content: string;
     try {
-      content = await state.client.sendPrompt(promptText, DEFAULT_TURN_TIMEOUT_MS);
+      content = await state.client.sendPrompt(promptText, DEFAULT_TURN_TIMEOUT_MS, onChunk);
     } catch (err) {
       process.stderr.write(
         `acp-server: prompt failed for session ${sessionId}: ${err}\n`
@@ -173,15 +200,20 @@ class ClaudeAgent implements Agent {
       this.pool.release(sessionKey);
     }
 
-    // Emit accumulated text as a single agent_message_chunk.
-    if (content) {
+    // Cumulative-length reconciliation: emit the tail of finalText that was not
+    // already covered by streamed chunks. This handles three cases:
+    //   - no chunks streamed (streamedLength===0): emit full content as before
+    //   - partial chunks: emit the remaining suffix
+    //   - full coverage (streamedLength >= content.length): no duplicate emit
+    if (content && content.length > streamedLength) {
+      const tail = content.slice(streamedLength);
       await this.connection.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
           content: {
             type: "text",
-            text: content,
+            text: tail,
           },
         },
       });

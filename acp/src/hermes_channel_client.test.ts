@@ -238,4 +238,69 @@ describe("HermesChannelClient", () => {
       await closeServer.stop();
     }
   });
+
+  // --------------------------------------------------------------------------
+  // Progressive streaming (V2) — chunk messages
+  // --------------------------------------------------------------------------
+
+  it("chunk messages invoke onChunk callback without resolving the promise early", async () => {
+    const chunkServer = await startFakeServer((msg, sock) => {
+      const requestId = msg["request_id"] as string;
+      // Send two chunks then the final result
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: "Hello" }) + "\n");
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: " world" }) + "\n");
+      sock.write(JSON.stringify({ type: "result", request_id: requestId, content: "Hello world", duration_ms: 10 }) + "\n");
+    });
+    const chunkClient = new HermesChannelClient(chunkServer.socketPath);
+    const deltas: string[] = [];
+    try {
+      const result = await chunkClient.sendPrompt("stream me", 5000, (delta) => {
+        deltas.push(delta);
+      });
+      expect(result).toBe("Hello world");
+      expect(deltas).toEqual(["Hello", " world"]);
+    } finally {
+      chunkClient.close();
+      await chunkServer.stop();
+    }
+  });
+
+  it("chunk messages with no onChunk callback are silently ignored", async () => {
+    const chunkServer = await startFakeServer((msg, sock) => {
+      const requestId = msg["request_id"] as string;
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: "partial" }) + "\n");
+      sock.write(JSON.stringify({ type: "result", request_id: requestId, content: "partial result", duration_ms: 5 }) + "\n");
+    });
+    const chunkClient = new HermesChannelClient(chunkServer.socketPath);
+    try {
+      // No onChunk provided — must not throw
+      const result = await chunkClient.sendPrompt("no callback", 5000);
+      expect(result).toBe("partial result");
+    } finally {
+      chunkClient.close();
+      await chunkServer.stop();
+    }
+  });
+
+  it("multiple chunk messages accumulate in order before result resolves", async () => {
+    const chunkServer = await startFakeServer((msg, sock) => {
+      const requestId = msg["request_id"] as string;
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: "A" }) + "\n");
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: "B" }) + "\n");
+      sock.write(JSON.stringify({ type: "chunk", request_id: requestId, content: "C" }) + "\n");
+      sock.write(JSON.stringify({ type: "result", request_id: requestId, content: "ABC", duration_ms: 1 }) + "\n");
+    });
+    const chunkClient = new HermesChannelClient(chunkServer.socketPath);
+    const received: string[] = [];
+    try {
+      const result = await chunkClient.sendPrompt("multi-chunk", 5000, (d) => received.push(d));
+      expect(received).toEqual(["A", "B", "C"]);
+      expect(result).toBe("ABC");
+      // pendingCount is 0 after resolution
+      expect(chunkClient.pendingCount).toBe(0);
+    } finally {
+      chunkClient.close();
+      await chunkServer.stop();
+    }
+  });
 });

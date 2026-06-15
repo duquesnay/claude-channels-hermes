@@ -7,8 +7,20 @@
  *
  * Protocol:
  *   SEND: {"type":"prompt","request_id":"<uuid>","content":"<text>","timeout_ms":<int>}\n
- *   RECV: {"type":"result","request_id":"...","content":"...","duration_ms":<int>}
+ *   RECV: {"type":"chunk","request_id":"...","content":"<delta>"}       ← progressive, V2
+ *      or {"type":"result","request_id":"...","content":"...","duration_ms":<int>}
  *      or {"type":"error","request_id":"...","error":"..."}
+ *
+ * Progressive streaming (V2): the plugin emits "chunk" messages containing
+ * only the delta (new content) since the previous chunk. The sendPrompt caller
+ * can supply an optional onChunk callback that receives each delta in order.
+ * The "result" message still carries the complete final text; the supervisor
+ * uses length-based reconciliation to avoid double-delivering content already
+ * streamed as chunks.
+ *
+ * Timeout: a chunk arriving does NOT reset the timeout — the 120s budget is
+ * for the full turn (open-to-close), not per-chunk silence. This is deliberate:
+ * a streaming reply still finishes within the same overall deadline.
  *
  * On socket close or error: all pending requests are rejected and the connection
  * is dropped. The next sendPrompt() call will reconnect automatically.
@@ -24,7 +36,11 @@ import { randomUUID } from "crypto";
 // ---------------------------------------------------------------------------
 
 export interface HermesChannelClientInterface {
-  sendPrompt(content: string, timeoutMs: number): Promise<string>;
+  sendPrompt(
+    content: string,
+    timeoutMs: number,
+    onChunk?: (delta: string) => void
+  ): Promise<string>;
   close(): void;
   /** Number of in-flight requests waiting for a response. Used by graceful drain. */
   get pendingCount(): number;
@@ -38,6 +54,8 @@ interface PendingEntry {
   resolve: (content: string) => void;
   reject: (err: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /** Optional callback for streaming deltas (V2). */
+  onChunk?: (delta: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,10 +178,22 @@ export class HermesChannelClient implements HermesChannelClientInterface {
       return;
     }
 
+    const msgType = msg["type"] as string | undefined;
+
+    if (msgType === "chunk") {
+      // Progressive delta — forward to caller without resolving the pending.
+      // The timeout is NOT reset: the 120s budget covers the entire turn.
+      const delta = String(msg["content"] ?? "");
+      if (delta && entry.onChunk) {
+        entry.onChunk(delta);
+      }
+      return;
+    }
+
+    // "result" and "error" are terminal — remove the pending entry.
     this.pending.delete(requestId);
     clearTimeout(entry.timer);
 
-    const msgType = msg["type"] as string | undefined;
     if (msgType === "result") {
       entry.resolve(String(msg["content"] ?? ""));
     } else if (msgType === "error") {
@@ -204,7 +234,11 @@ export class HermesChannelClient implements HermesChannelClientInterface {
   // sendPrompt — public API
   // --------------------------------------------------------------------------
 
-  async sendPrompt(content: string, timeoutMs: number): Promise<string> {
+  async sendPrompt(
+    content: string,
+    timeoutMs: number,
+    onChunk?: (delta: string) => void
+  ): Promise<string> {
     await this.connect();
 
     const requestId = randomUUID();
@@ -221,7 +255,7 @@ export class HermesChannelClient implements HermesChannelClientInterface {
       }, timeoutMs);
       timer.unref();
 
-      this.pending.set(requestId, { resolve, reject, timer });
+      this.pending.set(requestId, { resolve, reject, timer, onChunk });
 
       const msg =
         JSON.stringify({

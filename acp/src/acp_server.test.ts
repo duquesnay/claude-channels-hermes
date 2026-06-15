@@ -7,6 +7,7 @@
  *   - generation token presence in newSession and prompt responses
  *   - pool routing and refusal when pool is full
  *   - error handling (unknown session, client failure)
+ *   - progressive streaming: onChunk forwarding + tail reconciliation
  */
 
 import { describe, it, expect, mock } from "bun:test";
@@ -48,7 +49,7 @@ function makeMockState(overrides: Partial<SessionState> = {}): SessionState {
     socketPath: "/tmp/fake.sock",
     expectPid: 99000,
     client: {
-      sendPrompt: async (_content: string, _timeoutMs: number) => "mock response",
+      sendPrompt: async (_content: string, _timeoutMs: number, _onChunk?: (d: string) => void) => "mock response",
       close: () => {},
       get pendingCount() { return 0; },
     },
@@ -209,7 +210,7 @@ describe("createAgent", () => {
     const pool = makeMockPool({
       state: {
         client: {
-          sendPrompt: async () => "Hello from hermes",
+          sendPrompt: async (_c: string, _t: number, _onChunk?: (d: string) => void) => "Hello from hermes",
           close: () => {},
           get pendingCount() { return 0; },
         },
@@ -237,7 +238,7 @@ describe("createAgent", () => {
     const pool = makeMockPool({
       state: {
         client: {
-          sendPrompt: async (content: string) => {
+          sendPrompt: async (content: string, _t: number, _onChunk?: (d: string) => void) => {
             capturedText = content;
             return "ok";
           },
@@ -310,6 +311,130 @@ describe("createAgent", () => {
     await expect(
       agent.prompt({ sessionId: "unknown-session", prompt: [{ type: "text", text: "hi" }] } as any)
     ).rejects.toThrow("not found");
+  });
+
+  // --------------------------------------------------------------------------
+  // Progressive streaming (V2)
+  // --------------------------------------------------------------------------
+
+  it("prompt forwards onChunk deltas as individual agent_message_chunk updates", async () => {
+    const { conn, updates } = makeMockConnection();
+    const pool = makeMockPool({
+      state: {
+        client: {
+          sendPrompt: async (
+            _content: string,
+            _timeoutMs: number,
+            onChunk?: (delta: string) => void
+          ) => {
+            // Simulate the plugin calling reply_chunk multiple times with deltas
+            if (onChunk) {
+              await onChunk("Hello");
+              await onChunk(", ");
+              await onChunk("world");
+            }
+            return "Hello, world";
+          },
+          close: () => {},
+          get pendingCount() { return 0; },
+        },
+      },
+    });
+    const agent = createAgent(conn, pool);
+
+    const { sessionId } = await agent.newSession({} as any);
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "stream" }],
+    } as any);
+
+    // When chunks fully cover the final text, expect exactly 3 sessionUpdate calls
+    // (the 3 delta chunks — no tail emitted because "Hello, world" is fully covered)
+    const chunkUpdates = updates.filter(
+      (u) =>
+        u.sessionId === sessionId &&
+        (u.update as any).sessionUpdate === "agent_message_chunk"
+    );
+    expect(chunkUpdates.length).toBe(3);
+    expect((chunkUpdates[0]!.update as any).content.text).toBe("Hello");
+    expect((chunkUpdates[1]!.update as any).content.text).toBe(", ");
+    expect((chunkUpdates[2]!.update as any).content.text).toBe("world");
+  });
+
+  it("prompt emits tail when final text is longer than streamed chunks", async () => {
+    const { conn, updates } = makeMockConnection();
+    const pool = makeMockPool({
+      state: {
+        client: {
+          sendPrompt: async (
+            _content: string,
+            _timeoutMs: number,
+            onChunk?: (delta: string) => void
+          ) => {
+            // Only partial chunks streamed (first 5 chars of "Hello world, the rest")
+            if (onChunk) {
+              await onChunk("Hello");
+            }
+            return "Hello world, the rest";
+          },
+          close: () => {},
+          get pendingCount() { return 0; },
+        },
+      },
+    });
+    const agent = createAgent(conn, pool);
+
+    const { sessionId } = await agent.newSession({} as any);
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "partial stream" }],
+    } as any);
+
+    const chunkUpdates = updates.filter(
+      (u) =>
+        u.sessionId === sessionId &&
+        (u.update as any).sessionUpdate === "agent_message_chunk"
+    );
+    // Should have 2 updates: the chunk delta + the tail
+    expect(chunkUpdates.length).toBe(2);
+    expect((chunkUpdates[0]!.update as any).content.text).toBe("Hello");
+    expect((chunkUpdates[1]!.update as any).content.text).toBe(" world, the rest");
+  });
+
+  it("prompt emits full text as one chunk when no onChunk was called (no-stream fallback)", async () => {
+    const { conn, updates } = makeMockConnection();
+    const pool = makeMockPool({
+      state: {
+        client: {
+          sendPrompt: async (
+            _content: string,
+            _timeoutMs: number,
+            _onChunk?: (delta: string) => void
+          ) => {
+            // No chunks emitted — Claude only called reply_open + reply_close
+            return "Full reply in one shot";
+          },
+          close: () => {},
+          get pendingCount() { return 0; },
+        },
+      },
+    });
+    const agent = createAgent(conn, pool);
+
+    const { sessionId } = await agent.newSession({} as any);
+    await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "single shot" }],
+    } as any);
+
+    const chunkUpdates = updates.filter(
+      (u) =>
+        u.sessionId === sessionId &&
+        (u.update as any).sessionUpdate === "agent_message_chunk"
+    );
+    // Exactly one update with the full content — same as pre-streaming behavior
+    expect(chunkUpdates.length).toBe(1);
+    expect((chunkUpdates[0]!.update as any).content.text).toBe("Full reply in one shot");
   });
 
   // --------------------------------------------------------------------------
