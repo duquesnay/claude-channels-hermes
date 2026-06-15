@@ -34,10 +34,24 @@ spawn /Users/guillaume/.local/bin/claude \
     --model haiku \
     --allowedTools "mcp__plugin_hermes-channel_hermes-channel__* Read"
 
-# Dismiss the dev-channels TUI confirmation (two blind Enters, robust no-op otherwise).
-sleep 4
-send "\r"
-sleep 3
-send "\r"
+# Dismiss the dev-channels TUI confirmation by matching the prompt as soon as it
+# appears (~725ms) instead of two blind sleeps (4s+3s). Spike 2026-06-15:
+# spawn->socket-ready ~7.5s -> ~1.1s (-85%). The timeouts are safety nets: if the
+# TUI text changes and no pattern matches, we wait then continue (≈ one blind Enter).
+set timeout 8
+expect {
+    -re {development|[Cc]onfirm|[Pp]roceed|trust|cancel} {
+        send "\r"
+        set timeout 5
+        expect {
+            -re {development|[Cc]onfirm|[Pp]roceed|trust|cancel} { send "\r" }
+            timeout {}
+            eof { exit 0 }
+        }
+    }
+    timeout {}
+    eof { exit 0 }
+}
+set timeout -1
 
 expect eof
