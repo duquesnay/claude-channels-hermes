@@ -645,3 +645,124 @@ describe("idle eviction", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS: excludes claude.ai account connectors
+// ---------------------------------------------------------------------------
+
+describe("HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS", () => {
+  it("injects ENABLE_CLAUDEAI_MCP_SERVERS=0 when env var is set", async () => {
+    const origEnv = process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+    process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = "1";
+
+    const fakeServers = new Map<string, Server>();
+    const spawnedEnvs: Record<string, string>[] = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnedEnvs.push(env);
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 88001;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("connector-exclude-key");
+
+    expect(spawnedEnvs.length).toBe(1);
+    expect(spawnedEnvs[0]["ENABLE_CLAUDEAI_MCP_SERVERS"]).toBe("0");
+
+    if (origEnv === undefined) {
+      delete process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+    } else {
+      process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = origEnv;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("does NOT inject ENABLE_CLAUDEAI_MCP_SERVERS when env var is absent", async () => {
+    const origEnv = process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+    delete process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+
+    const fakeServers = new Map<string, Server>();
+    const spawnedEnvs: Record<string, string>[] = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnedEnvs.push(env);
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 88002;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("connector-default-key");
+
+    expect(spawnedEnvs.length).toBe(1);
+    expect(spawnedEnvs[0]["ENABLE_CLAUDEAI_MCP_SERVERS"]).toBeUndefined();
+
+    if (origEnv !== undefined) {
+      process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = origEnv;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("does NOT inject ENABLE_CLAUDEAI_MCP_SERVERS when env var is '0'", async () => {
+    const origEnv = process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+    process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = "0";
+
+    const fakeServers = new Map<string, Server>();
+    const spawnedEnvs: Record<string, string>[] = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnedEnvs.push(env);
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 88003;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("connector-off-key");
+
+    expect(spawnedEnvs.length).toBe(1);
+    expect(spawnedEnvs[0]["ENABLE_CLAUDEAI_MCP_SERVERS"]).toBeUndefined();
+
+    if (origEnv === undefined) {
+      delete process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
+    } else {
+      process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = origEnv;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+});

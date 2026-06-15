@@ -17,10 +17,21 @@
  *    DELTA vs CATCH-UP decision.
  *
  * Environment:
- *   HERMES_CHANNELS_IDLE_TTL_MS   idle eviction TTL  (default: 30 min)
- *   HERMES_CHANNELS_MAX_SESSIONS  capacity cap        (default: 10)
- *   HERMES_HOME                   base dir            (default: ~/.hermes)
- *   HERMES_CHANNEL_SOCKET         overrides socket path (single-session compat)
+ *   HERMES_CHANNELS_IDLE_TTL_MS          idle eviction TTL  (default: 30 min)
+ *   HERMES_CHANNELS_MAX_SESSIONS         capacity cap        (default: 10)
+ *   HERMES_HOME                          base dir            (default: ~/.hermes)
+ *   HERMES_CHANNEL_SOCKET                overrides socket path (single-session compat)
+ *   HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS  when set (any value), injects
+ *                                        ENABLE_CLAUDEAI_MCP_SERVERS=0 into
+ *                                        the claude child so account-level
+ *                                        claude.ai connectors (Gmail, Notes,
+ *                                        Drive, Slack…) are not loaded.
+ *                                        Default: unset (connectors load
+ *                                        normally — prod ~/.hermes wants them).
+ *                                        Verified 2026-06-15: triggers
+ *                                        "[claudeai-mcp] Disabled via env var";
+ *                                        hermes-channel plugin and subscription
+ *                                        auth remain intact.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -382,6 +393,15 @@ export class ChannelsSessionPool {
       }
     }
 
+    // When HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS is set, disable account-level
+    // claude.ai connectors (Gmail, Notes, Drive, Slack…) in the child claude
+    // session by injecting ENABLE_CLAUDEAI_MCP_SERVERS=0.  The supervisor's
+    // own env is the authoritative source so janet_test and prod can diverge
+    // without touching the launcher or credentials.  Default: unset (prod
+    // ~/.hermes keeps connectors enabled).
+    const noAccountConnectors =
+      Boolean(process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"]) &&
+      process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] !== "0";
     const expectPid = this.deps.spawnLauncher(this.launcherExpPath, {
       HERMES_CHANNEL_SOCKET: socketPath,
       HERMES_SESSION_NAME: sessionName,
@@ -389,6 +409,7 @@ export class ChannelsSessionPool {
       // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
       // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
       HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
+      ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
     });
 
     process.stderr.write(
