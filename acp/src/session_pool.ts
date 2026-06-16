@@ -19,6 +19,8 @@
  * Environment:
  *   HERMES_CHANNELS_IDLE_TTL_MS          idle eviction TTL  (default: 30 min)
  *   HERMES_CHANNELS_MAX_SESSIONS         capacity cap        (default: 10)
+ *   HERMES_CHANNELS_MIN_WARM             keep N most-recently-active sessions
+ *                                        alive past idle TTL (default: 0)
  *   HERMES_HOME                          base dir            (default: ~/.hermes)
  *   HERMES_CHANNEL_SOCKET                overrides socket path (single-session compat)
  *   HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS  when set (any value), injects
@@ -61,6 +63,15 @@ function getIdleTtlMs(): number {
 /** Read cap at call time so tests can override the env var before constructing the pool. */
 function getMaxSessions(): number {
   return Number(process.env["HERMES_CHANNELS_MAX_SESSIONS"] ?? 10);
+}
+
+/**
+ * Read MIN_WARM at call time so tests can override the env var.
+ * MIN_WARM should be < MAX_SESSIONS. It protects only from idle eviction,
+ * not from the hard capacity cap (evictLruIdle).
+ */
+function getMinWarm(): number {
+  return Number(process.env["HERMES_CHANNELS_MIN_WARM"] ?? 0);
 }
 
 /** Wait budget for the expect launcher to bind the socket. */
@@ -575,7 +586,25 @@ export class ChannelsSessionPool {
    * Accepts `now` so tests can inject a deterministic clock.
    */
   async scanAndEvictIdle(now: number): Promise<void> {
+    // Compute the warm set: the N most-recently-active sessions are protected
+    // from idle eviction. MIN_WARM should be < MAX_SESSIONS.
+    const minWarm = getMinWarm();
+    const warmSet = new Set<string>();
+    if (minWarm > 0) {
+      const sorted = [...this.sessions.keys()].sort((a, b) => {
+        const aActivity = this.sessions.get(a)!.lastActivityAt;
+        const bActivity = this.sessions.get(b)!.lastActivityAt;
+        return bActivity - aActivity; // descending: most recent first
+      });
+      for (const key of sorted.slice(0, minWarm)) {
+        warmSet.add(key);
+      }
+    }
+
     for (const [key, state] of [...this.sessions]) {
+      // Skip sessions in the warm set — protected from idle eviction.
+      if (warmSet.has(key)) continue;
+
       const idleMs = now - state.lastActivityAt;
       if (idleMs >= getIdleTtlMs() && state.client.pendingCount === 0) {
         process.stderr.write(

@@ -647,6 +647,129 @@ describe("idle eviction", () => {
 });
 
 // ---------------------------------------------------------------------------
+// HERMES_CHANNELS_MIN_WARM: protects N most-recently-active sessions from idle eviction
+// ---------------------------------------------------------------------------
+
+describe("HERMES_CHANNELS_MIN_WARM", () => {
+  it("MIN_WARM unset (0): existing idle eviction behavior unchanged", async () => {
+    const IDLE_TTL_MS_ORIG = process.env["HERMES_CHANNELS_IDLE_TTL_MS"];
+    const MIN_WARM_ORIG = process.env["HERMES_CHANNELS_MIN_WARM"];
+    process.env["HERMES_CHANNELS_IDLE_TTL_MS"] = "1000";
+    delete process.env["HERMES_CHANNELS_MIN_WARM"];
+
+    const fakeServers = new Map<string, Server>();
+    const nowValue = { value: Date.now() };
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 91000 + fakeServers.size;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return nowValue.value; },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+
+    // Create 3 sessions with distinct lastActivityAt by staggering the clock.
+    await pool.getOrCreate("warm-none-1"); nowValue.value += 100;
+    await pool.getOrCreate("warm-none-2"); nowValue.value += 100;
+    await pool.getOrCreate("warm-none-3"); nowValue.value += 100;
+    expect(pool.size).toBe(3);
+
+    // Advance clock past TTL — all sessions should be evicted (MIN_WARM=0).
+    nowValue.value += 2000;
+    await pool.scanAndEvictIdle(nowValue.value);
+    expect(pool.size).toBe(0);
+
+    if (IDLE_TTL_MS_ORIG === undefined) {
+      delete process.env["HERMES_CHANNELS_IDLE_TTL_MS"];
+    } else {
+      process.env["HERMES_CHANNELS_IDLE_TTL_MS"] = IDLE_TTL_MS_ORIG;
+    }
+    if (MIN_WARM_ORIG === undefined) {
+      delete process.env["HERMES_CHANNELS_MIN_WARM"];
+    } else {
+      process.env["HERMES_CHANNELS_MIN_WARM"] = MIN_WARM_ORIG;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("MIN_WARM=2: the 2 most-recently-active sessions survive past idle TTL", async () => {
+    const IDLE_TTL_MS_ORIG = process.env["HERMES_CHANNELS_IDLE_TTL_MS"];
+    const MIN_WARM_ORIG = process.env["HERMES_CHANNELS_MIN_WARM"];
+    process.env["HERMES_CHANNELS_IDLE_TTL_MS"] = "1000";
+    process.env["HERMES_CHANNELS_MIN_WARM"] = "2";
+
+    const fakeServers = new Map<string, Server>();
+    const nowValue = { value: 1_000_000 }; // fixed start — deterministic
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 92000 + fakeServers.size;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return nowValue.value; },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+
+    // Create sessions with distinct lastActivityAt by staggering the clock.
+    // "warm-old" is oldest (lowest lastActivityAt), "warm-new2" is newest.
+    await pool.getOrCreate("warm-old");  // lastActivityAt = 1_000_000
+    nowValue.value += 100;
+    await pool.getOrCreate("warm-mid");  // lastActivityAt = 1_000_100
+    nowValue.value += 100;
+    await pool.getOrCreate("warm-new1"); // lastActivityAt = 1_000_200
+    nowValue.value += 100;
+    await pool.getOrCreate("warm-new2"); // lastActivityAt = 1_000_300
+    expect(pool.size).toBe(4);
+
+    // Advance clock past TTL for all sessions.
+    nowValue.value += 5000;
+    await pool.scanAndEvictIdle(nowValue.value);
+
+    // Only the 2 most recent (warm-new1, warm-new2) should survive.
+    expect(pool.size).toBe(2);
+    // The oldest two should be gone.
+    expect(pool["sessions"].has("warm-old")).toBe(false);
+    expect(pool["sessions"].has("warm-mid")).toBe(false);
+    // The newest two should be protected.
+    expect(pool["sessions"].has("warm-new1")).toBe(true);
+    expect(pool["sessions"].has("warm-new2")).toBe(true);
+
+    if (IDLE_TTL_MS_ORIG === undefined) {
+      delete process.env["HERMES_CHANNELS_IDLE_TTL_MS"];
+    } else {
+      process.env["HERMES_CHANNELS_IDLE_TTL_MS"] = IDLE_TTL_MS_ORIG;
+    }
+    if (MIN_WARM_ORIG === undefined) {
+      delete process.env["HERMES_CHANNELS_MIN_WARM"];
+    } else {
+      process.env["HERMES_CHANNELS_MIN_WARM"] = MIN_WARM_ORIG;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS: excludes claude.ai account connectors
 // ---------------------------------------------------------------------------
 
