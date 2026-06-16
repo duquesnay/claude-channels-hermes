@@ -304,3 +304,58 @@ describe("HermesChannelClient", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Send serialization: two rapid sendPrompt calls must not race
+// ---------------------------------------------------------------------------
+
+describe("sendPrompt send serialization", () => {
+  it("two rapid sends both register and resolve correctly without racing", async () => {
+    // The fake server holds request 1 (no reply immediately) and replies to
+    // request 2 first, then request 1. Both promises must resolve with their
+    // own correct content regardless of reply order — proving that the send
+    // chain does NOT serialize the full turn (only the write step).
+    const replies = new Map<string, () => void>();
+
+    const raceServer = await startFakeServer((msg, sock) => {
+      const requestId = msg["request_id"] as string;
+      const content = msg["content"] as string;
+      // Store a trigger for each request so the test can control reply order.
+      replies.set(requestId, () => {
+        sock.write(
+          JSON.stringify({ type: "result", request_id: requestId, content: `echo: ${content}`, duration_ms: 0 }) + "\n"
+        );
+      });
+    });
+
+    const raceClient = new HermesChannelClient(raceServer.socketPath);
+
+    try {
+      // Fire both sends without awaiting — they should both be registered.
+      const p1 = raceClient.sendPrompt("first", 5000);
+      const p2 = raceClient.sendPrompt("second", 5000);
+
+      // Wait briefly for both writes to have been dispatched to the server.
+      await new Promise((res) => setTimeout(res, 50));
+
+      // Both requests should now be registered on the server side.
+      expect(replies.size).toBe(2);
+
+      // Reply to request 2 first, then request 1.
+      const [id1, trigger1] = [...replies.entries()][0]!;
+      const [, trigger2] = [...replies.entries()][1]!;
+      void id1; // used implicitly via ordering assertion
+
+      trigger2(); // reply to second first
+      const result2 = await p2;
+      expect(result2).toBe("echo: second");
+
+      trigger1(); // now reply to first
+      const result1 = await p1;
+      expect(result1).toBe("echo: first");
+    } finally {
+      raceClient.close();
+      await raceServer.stop();
+    }
+  });
+});

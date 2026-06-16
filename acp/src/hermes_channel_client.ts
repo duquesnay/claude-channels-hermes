@@ -74,6 +74,13 @@ export class HermesChannelClient implements HermesChannelClientInterface {
   private connectPromise: Promise<void> | null = null;
   private readonly pending = new Map<string, PendingEntry>();
   private readBuffer = "";
+  /**
+   * Serializes the send/registration step per connection.
+   * Each sendPrompt chains its connect+register+write step onto this promise
+   * so socket writes never interleave. Results still resolve independently by
+   * request_id — only the send step (not the full turn) is serialized.
+   */
+  private _sendChain: Promise<unknown> = Promise.resolve();
 
   // --------------------------------------------------------------------------
   // pendingCount — observable for graceful drain
@@ -218,6 +225,8 @@ export class HermesChannelClient implements HermesChannelClientInterface {
     this.socket = null;
     this.connectPromise = null;
     this.readBuffer = "";
+    // Reset the send chain so the next reconnect starts fresh.
+    this._sendChain = Promise.resolve();
 
     if (sock) {
       try { sock.destroy(); } catch { /* already destroyed */ }
@@ -239,23 +248,19 @@ export class HermesChannelClient implements HermesChannelClientInterface {
     timeoutMs: number,
     onChunk?: (delta: string) => void
   ): Promise<string> {
-    await this.connect();
+    // resultPromise is set during the send step and returned after the write
+    // goes out. Awaiting it here is NOT serialized — results resolve
+    // independently by request_id via handleLine().
+    let resultPromise!: Promise<string>;
 
-    const requestId = randomUUID();
+    // Serialize only the connect + register + write step so concurrent calls
+    // on the same connection cannot interleave socket writes. The chain
+    // advances as soon as the write has been dispatched (not when the result
+    // arrives), preserving multiplexed request_id semantics.
+    const sendStep = this._sendChain.then(async () => {
+      await this.connect();
 
-    // Register pending BEFORE writing to the socket (fast echo can arrive immediately)
-    const result = await new Promise<string>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId);
-        reject(
-          new Error(
-            `hermes-channel-client: timeout after ${timeoutMs}ms (request_id=${requestId})`
-          )
-        );
-      }, timeoutMs);
-      timer.unref();
-
-      this.pending.set(requestId, { resolve, reject, timer, onChunk });
+      const requestId = randomUUID();
 
       const msg =
         JSON.stringify({
@@ -265,22 +270,45 @@ export class HermesChannelClient implements HermesChannelClientInterface {
           timeout_ms: timeoutMs,
         }) + "\n";
 
-      const sock = this.socket!;
-      sock.write(msg, "utf8", (err?: Error | null) => {
-        if (err) {
+      // Register pending BEFORE writing (fast echo can arrive immediately).
+      resultPromise = new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
           this.pending.delete(requestId);
-          clearTimeout(timer);
           reject(
-            new Error(`hermes-channel-client: write failed: ${err.message}`)
+            new Error(
+              `hermes-channel-client: timeout after ${timeoutMs}ms (request_id=${requestId})`
+            )
           );
-          this.dropConnection(
-            new Error(`hermes-channel-client: write failed: ${err.message}`)
-          );
-        }
+        }, timeoutMs);
+        timer.unref();
+
+        this.pending.set(requestId, { resolve, reject, timer, onChunk });
+
+        const sock = this.socket!;
+        sock.write(msg, "utf8", (err?: Error | null) => {
+          if (err) {
+            this.pending.delete(requestId);
+            clearTimeout(timer);
+            reject(
+              new Error(`hermes-channel-client: write failed: ${err.message}`)
+            );
+            this.dropConnection(
+              new Error(`hermes-channel-client: write failed: ${err.message}`)
+            );
+          }
+        });
       });
     });
 
-    return result;
+    // Swallow errors on the chain so a failed send does not deadlock subsequent
+    // sends. The caller will observe the error via the rejected resultPromise.
+    this._sendChain = sendStep.then(() => undefined, () => undefined);
+
+    // Await the send step to surface connect/write errors before returning.
+    await sendStep;
+
+    // Await the result independently — not serialized with other turns.
+    return resultPromise;
   }
 
   // --------------------------------------------------------------------------
