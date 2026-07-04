@@ -54,23 +54,31 @@ if {$settings_file ne ""} {
         --allowedTools $allowed_tools
 }
 
-# Dismiss the dev-channels TUI confirmation by matching the prompt as soon as it
-# appears (~725ms) instead of two blind sleeps (4s+3s). Spike 2026-06-15:
-# spawn->socket-ready ~7.5s -> ~1.1s (-85%). The timeouts are safety nets: if the
-# TUI text changes and no pattern matches, we wait then continue (≈ one blind Enter).
-set timeout 8
-expect {
-    -re {development|[Cc]onfirm|[Pp]roceed|trust|cancel} {
-        send "\r"
-        set timeout 5
-        expect {
-            -re {development|[Cc]onfirm|[Pp]roceed|trust|cancel} { send "\r" }
-            timeout {}
-            eof { exit 0 }
+# Dismiss sequential TUI prompts (dev-channels confirmation, folder-trust, ...)
+# by matching the single word "confirm" — the ONLY reliable anchor.
+#
+# Hard-won findings (badjanet bringup 2026-07-04, see zeta session notes):
+# - The raw pty stream interleaves ANSI codes inside sentences
+#   (\e[1mEnter\e[22m to confirm), so multi-word patterns like
+#   "Enter to confirm" NEVER match on slow boots.
+# - The historical pattern {development|confirm|...} matched the spawn
+#   command ECHO (--dangerously-load-DEVELOPMENT-channels) and fired the
+#   Enters before the TUI existed; the TUI purges buffered input on draw.
+#   It only worked when claude booted to the prompt in <1s.
+# - Blind timed sends fail too: boot-to-prompt varies 1-45s with host load.
+# The spawn echo contains "development" but never "confirm", so a bare
+# {confirm} match is safe and fires exactly when a prompt is on screen.
+set timeout 45
+for {set i 0} {$i < 3} {incr i} {
+    expect {
+        -re {confirm} {
+            sleep 1
+            send "\r"
+            set timeout 20
         }
+        timeout { break }
+        eof { exit 0 }
     }
-    timeout {}
-    eof { exit 0 }
 }
 set timeout -1
 
