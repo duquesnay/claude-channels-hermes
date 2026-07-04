@@ -1,0 +1,19 @@
+{
+  "name": "claude-channels-acp",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "acp-server": "./src/acp_entrypoint.ts"
+  },
+  "scripts": {
+    "test": "bun test src/",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "0.22.1"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.14"
+  }
+}

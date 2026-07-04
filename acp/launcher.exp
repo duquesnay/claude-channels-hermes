@@ -1,0 +1,85 @@
+#!/usr/bin/env expect -f
+# Launch a persistent claude --channels session for the ACP session pool.
+#
+# Parameterized via environment variables (injected by session_pool.ts):
+#   HERMES_CHANNEL_SOCKET   Socket path for the hermes-channel plugin to bind.
+#                           Propagates to the plugin bun child via parent env
+#                           (voie a — proven in spike 2026-06-14: no --strict-mcp-config).
+#   HERMES_SESSION_NAME     The --name for the claude process (claude_hermes_<hash8>).
+#                           Scoped per session_key — used for targeted kill on eviction.
+#   HERMES_SESSION_CWD      Working directory for the claude session.
+#
+# PTY is required so claude can receive the dev-channels TUI confirmation.
+# Two blind Enters dismiss the TUI prompt (no-op if not shown).
+#
+# NEVER use --strict-mcp-config: it suppresses the hermes-channel plugin entirely.
+
+set timeout -1
+log_user 1
+
+# Resolve parameters from environment, with safe defaults.
+# HERMES_CHANNEL_SOCKET does NOT need to be read here: expect inherits the full
+# parent env, and the spawn'd claude process inherits it from expect. The
+# hermes-channel plugin bun child then inherits it from claude (voie a, proven
+# in spike 2026-06-14). No --strict-mcp-config so the plugin actually starts.
+set session_name [expr { [info exists env(HERMES_SESSION_NAME)] ? $env(HERMES_SESSION_NAME) : "claude_hermes_acp" }]
+set session_cwd [expr { [info exists env(HERMES_SESSION_CWD)] ? $env(HERMES_SESSION_CWD) : [pwd] }]
+# Custom settings file (HERMES_CLAUDE_SETTINGS_FILE, same env var as claude_daemon):
+# a controlled allow-list + only the hermes MCP, EXCLUDING the user's private
+# plugins/connectors (context7, claude.ai Gmail/Drive/Notes...). Isolates the
+# session's toolset from ~/.claude without touching the account/HOME.
+set settings_file [expr { [info exists env(HERMES_CLAUDE_SETTINGS_FILE)] ? $env(HERMES_CLAUDE_SETTINGS_FILE) : "" }]
+# Default = lean tool set (janet_test unchanged). Prod overrides via
+# HERMES_CLAUDE_ALLOWED_TOOLS to include its full plugin set (space-separated,
+# passed as a single string — same shape as the hardcoded default below).
+set allowed_tools [expr { [info exists env(HERMES_CLAUDE_ALLOWED_TOOLS)] && $env(HERMES_CLAUDE_ALLOWED_TOOLS) ne "" ? $env(HERMES_CLAUDE_ALLOWED_TOOLS) : "mcp__plugin_hermes-channel_hermes-channel__* Read" }]
+
+cd $session_cwd
+
+if {$settings_file ne ""} {
+    spawn /Users/guillaume/.local/bin/claude \
+        --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+        --name $session_name \
+        --permission-mode auto \
+        --model haiku \
+        --setting-sources project,local \
+        --settings $settings_file \
+        --allowedTools $allowed_tools
+} else {
+    spawn /Users/guillaume/.local/bin/claude \
+        --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
+        --name $session_name \
+        --permission-mode auto \
+        --model haiku \
+        --allowedTools $allowed_tools
+}
+
+# Dismiss sequential TUI prompts (dev-channels confirmation, folder-trust, ...)
+# by matching the single word "confirm" — the ONLY reliable anchor.
+#
+# Hard-won findings (badjanet bringup 2026-07-04, see zeta session notes):
+# - The raw pty stream interleaves ANSI codes inside sentences
+#   (\e[1mEnter\e[22m to confirm), so multi-word patterns like
+#   "Enter to confirm" NEVER match on slow boots.
+# - The historical pattern {development|confirm|...} matched the spawn
+#   command ECHO (--dangerously-load-DEVELOPMENT-channels) and fired the
+#   Enters before the TUI existed; the TUI purges buffered input on draw.
+#   It only worked when claude booted to the prompt in <1s.
+# - Blind timed sends fail too: boot-to-prompt varies 1-45s with host load.
+# The spawn echo contains "development" but never "confirm", so a bare
+# {confirm} match is safe and fires exactly when a prompt is on screen.
+set timeout 45
+for {set i 0} {$i < 3} {incr i} {
+    expect {
+        -re {confirm} {
+            sleep 1
+            send "\r"
+            set timeout 20
+        }
+        timeout { break }
+        eof { exit 0 }
+    }
+}
+set timeout -1
+
+expect eof
