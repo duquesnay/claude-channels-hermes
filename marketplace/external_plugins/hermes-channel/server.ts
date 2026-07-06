@@ -167,6 +167,7 @@ export async function handleReplyOpen(args: Record<string, unknown>) {
   if (!pending) {
     throw new Error(`reply_open: no pending IPC request for chat_id=${chat_id}`)
   }
+  clearTimeout(pending.guardTimer)
   const handle = randomUUID()
   streams.set(handle, {
     request_id: chat_id,
@@ -221,6 +222,7 @@ export async function handleReplyClose(args: Record<string, unknown>) {
         `reply_close: text is required when closing by chat_id (no prior reply_chunk to fall back on) — pass the final response text`,
       )
     }
+    clearTimeout(pending.guardTimer)
     pendingByRequestId.delete(chat_id)
     finalizeReply(chat_id, pending.conn, pending.startedAt, text)
     return { content: [{ type: 'text', text: 'closed' }] }
@@ -247,9 +249,57 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 interface PendingRequest {
   conn: Socket
   startedAt: number
+  guardTimer: ReturnType<typeof setTimeout>
 }
 
 export const pendingByRequestId = new Map<string, PendingRequest>()
+
+// ============================================================================
+// Anti-wedge guard — JA-24 v2 step 3
+// ============================================================================
+// A weak/distracted model can receive an inbound prompt and call NEITHER
+// reply_open NOR reply_close — plain assistant text, zero tool calls (this
+// reproduced live on janet-test: a heavy-persona haiku worker, ~40% of
+// turns). Without this guard the pending IPC request sits forever: Hermes'
+// sendPrompt is still awaiting a `result` line on this connection, and the
+// only thing that eventually unblocks it is the much coarser gateway-level
+// timeout (JA-27, 210-300s) — a fully wedged turn in the meantime.
+//
+// This guard fires much sooner (default 90s — comfortably inside a normal
+// turn, well past a stuck one) and writes an explicit `error` result so
+// sendPrompt fails fast and cleanly instead of wedging.
+//
+// Read fresh on every call (not cached at module load) so tests can override
+// per-case without a separate process — mirrors the existing
+// HERMES_CHANNEL_SOCKET / HERMES_CHANNELS_MAX_SESSIONS env-override pattern
+// used elsewhere in this codebase (acp/src/session_pool.ts).
+export function replyCloseGuardMs(): number {
+  return Number(process.env.HERMES_REPLY_CLOSE_GUARD_MS ?? 90_000)
+}
+
+// Arms the guard for a freshly-registered pending request. Fires at most
+// once: it only acts if the pendingByRequestId entry for this request_id is
+// STILL the original, never-opened, never-closed one — reply_open and
+// reply_close both delete it (and clear this timer) as part of normal
+// handling, so a legitimate close always wins the race, and a late
+// reply_open/reply_close after the guard already fired finds no pending
+// entry and fails with the same "no pending IPC request" error as any other
+// already-closed request (never a second write to the socket).
+export function armReplyCloseGuard(request_id: string): ReturnType<typeof setTimeout> {
+  return setTimeout(() => {
+    const pending = pendingByRequestId.get(request_id)
+    if (!pending) return
+    pendingByRequestId.delete(request_id)
+    const guardMs = replyCloseGuardMs()
+    ja24Log(`hermes-channel: reply_close_guard_fired request_id=${request_id} guard_ms=${guardMs} ts=${Date.now()}\n`)
+    const errReply = JSON.stringify({
+      type: 'error',
+      request_id,
+      error: `model completed without calling reply_close (no reply_open or reply_close within ${guardMs}ms)`,
+    }) + '\n'
+    pending.conn.write(errReply)
+  }, replyCloseGuardMs())
+}
 
 // ============================================================================
 // IPC server — listens on SOCKET_PATH for Hermes connections
@@ -284,8 +334,12 @@ function handleIpcLine(line: string, conn: Socket): void {
     return
   }
 
-  // Register pending so reply_open can retrieve the connection
-  pendingByRequestId.set(request_id, { conn, startedAt: Date.now() })
+  // Register pending so reply_open can retrieve the connection. Arm the
+  // anti-wedge guard (JA-24 v2 step 3) at the same time: if this model turn
+  // ends without ever calling reply_open or reply_close, the guard fires and
+  // fails the request explicitly instead of leaving it wedged.
+  const guardTimer = armReplyCloseGuard(request_id)
+  pendingByRequestId.set(request_id, { conn, startedAt: Date.now(), guardTimer })
 
   // Emit channel notification to Claude
   mcp.notification({
@@ -301,6 +355,7 @@ function handleIpcLine(line: string, conn: Socket): void {
     },
   }).catch(err => {
     process.stderr.write(`hermes-channel: failed to deliver notification to Claude: ${err}\n`)
+    clearTimeout(guardTimer)
     pendingByRequestId.delete(request_id)
     const errReply = JSON.stringify({
       type: 'error',

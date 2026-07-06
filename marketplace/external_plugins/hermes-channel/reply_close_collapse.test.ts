@@ -22,6 +22,14 @@ function fakeConn() {
   }
 }
 
+// PendingRequest now carries a guardTimer (JA-24 v2 anti-wedge guard — see
+// reply_close_guard.test.ts for its own behavior). These tests don't exercise
+// the guard, so a harmless long-lived dummy timer satisfies the shape;
+// handleReplyOpen/handleReplyClose clear it as part of normal handling.
+function dummyGuardTimer(): ReturnType<typeof setTimeout> {
+  return setTimeout(() => {}, 999_000)
+}
+
 beforeEach(() => {
   pendingByRequestId.clear()
   streams.clear()
@@ -30,7 +38,7 @@ beforeEach(() => {
 describe('reply_close by chat_id (collapsed protocol)', () => {
   test('closes directly with chat_id, no prior reply_open', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-1', { conn: conn as any, startedAt: Date.now() - 500 })
+    pendingByRequestId.set('chat-1', { conn: conn as any, startedAt: Date.now() - 500, guardTimer: dummyGuardTimer() })
 
     const result = await handleReplyClose({ chat_id: 'chat-1', text: 'final answer' })
 
@@ -61,7 +69,7 @@ describe('reply_close by chat_id (collapsed protocol)', () => {
 
   test('rejects a missing text on the chat_id fast path instead of sending a silent empty reply (JA-25 class)', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-2', { conn: conn as any, startedAt: Date.now() })
+    pendingByRequestId.set('chat-2', { conn: conn as any, startedAt: Date.now(), guardTimer: dummyGuardTimer() })
 
     await expect(handleReplyClose({ chat_id: 'chat-2' })).rejects.toThrow(
       /text is required when closing by chat_id/,
@@ -75,7 +83,7 @@ describe('reply_close by chat_id (collapsed protocol)', () => {
 
   test('rejects an explicit empty-string text on the chat_id fast path too', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-2b', { conn: conn as any, startedAt: Date.now() })
+    pendingByRequestId.set('chat-2b', { conn: conn as any, startedAt: Date.now(), guardTimer: dummyGuardTimer() })
 
     await expect(handleReplyClose({ chat_id: 'chat-2b', text: '' })).rejects.toThrow(
       /text is required when closing by chat_id/,
@@ -85,7 +93,7 @@ describe('reply_close by chat_id (collapsed protocol)', () => {
 
   test('retry after the missing-text rejection succeeds', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-2c', { conn: conn as any, startedAt: Date.now() })
+    pendingByRequestId.set('chat-2c', { conn: conn as any, startedAt: Date.now(), guardTimer: dummyGuardTimer() })
 
     await expect(handleReplyClose({ chat_id: 'chat-2c' })).rejects.toThrow()
     await handleReplyClose({ chat_id: 'chat-2c', text: 'retried answer' })
@@ -97,7 +105,7 @@ describe('reply_close by chat_id (collapsed protocol)', () => {
 
   test('after reply_open already consumed the chat_id, closing by chat_id fails with a guiding error', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-3', { conn: conn as any, startedAt: Date.now() })
+    pendingByRequestId.set('chat-3', { conn: conn as any, startedAt: Date.now(), guardTimer: dummyGuardTimer() })
 
     await handleReplyOpen({ chat_id: 'chat-3' })
 
@@ -110,7 +118,7 @@ describe('reply_close by chat_id (collapsed protocol)', () => {
 describe('reply_open + reply_close by handle (advanced path, still supported)', () => {
   test('reply_open then reply_chunk then reply_close(handle) still works end-to-end', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-4', { conn: conn as any, startedAt: Date.now() - 100 })
+    pendingByRequestId.set('chat-4', { conn: conn as any, startedAt: Date.now() - 100, guardTimer: dummyGuardTimer() })
 
     const openResult = await handleReplyOpen({ chat_id: 'chat-4' })
     const handle = openResult.content[0].text.replace('handle=', '')
@@ -126,7 +134,7 @@ describe('reply_open + reply_close by handle (advanced path, still supported)', 
 
   test('reply_close(handle) with no text override falls back to the last reply_chunk text', async () => {
     const conn = fakeConn()
-    pendingByRequestId.set('chat-5', { conn: conn as any, startedAt: Date.now() })
+    pendingByRequestId.set('chat-5', { conn: conn as any, startedAt: Date.now(), guardTimer: dummyGuardTimer() })
 
     const openResult = await handleReplyOpen({ chat_id: 'chat-5' })
     const handle = openResult.content[0].text.replace('handle=', '')
