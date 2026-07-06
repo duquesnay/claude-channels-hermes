@@ -39,7 +39,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, unlink, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import {
   isSocketLive,
@@ -174,8 +174,37 @@ export interface PoolDeps {
    * Called only if the process is still detectable after killPid + killSocketHolders.
    * Injected so tests can assert the exact pattern and confirm it was called
    * only when necessary (or not called when earlier steps sufficed).
+   *
+   * ONLY used by evict() (a session this exact instance tracked and
+   * spawned). Never used by reconcileOrphans() — see that method's
+   * docstring for why (pkill -f matches by argv machine-wide, not scoped
+   * to this instance).
    */
   killByName(sessionName: string): void;
+
+  /**
+   * List PIDs currently holding an open file descriptor on a socket path
+   * (lsof -t <path>). Pure discovery — does NOT kill anything. Used by
+   * reconcileOrphans()'s ancestry walk to find the leaf of a live orphaned
+   * subtree from its own socket path (the one thing we know for certain
+   * belongs to this exact session).
+   */
+  listSocketHolderPids(socketPath: string): number[];
+
+  /**
+   * Parent PID of a process, or undefined if the process no longer
+   * exists. Used by the ancestry walk to climb from a discovered leaf PID
+   * upward, one exact PID at a time.
+   */
+  getPpid(pid: number): number | undefined;
+
+  /**
+   * Full command line of a process, or undefined if it no longer exists.
+   * Used to verify a candidate's identity BEFORE killing it during the
+   * ancestry walk — never kill based on PID alone without confirming the
+   * argv actually matches this session's own signature.
+   */
+  getCommandLine(pid: number): string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +304,51 @@ function defaultIsPidAlive(pid: number): boolean {
   }
 }
 
+function defaultListSocketHolderPids(socketPath: string): number[] {
+  if (!existsSync(socketPath)) return [];
+  try {
+    const result = Bun.spawnSync(["lsof", "-t", socketPath], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    return new TextDecoder()
+      .decode(result.stdout)
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((s) => parseInt(s, 10))
+      .filter((n) => !isNaN(n));
+  } catch {
+    return [];
+  }
+}
+
+function defaultGetPpid(pid: number): number | undefined {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const n = parseInt(new TextDecoder().decode(result.stdout).trim(), 10);
+    return isNaN(n) ? undefined : n;
+  } catch {
+    return undefined;
+  }
+}
+
+function defaultGetCommandLine(pid: number): string | undefined {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const out = new TextDecoder().decode(result.stdout).trim();
+    return out.length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const PRODUCTION_DEPS: PoolDeps = {
   spawnLauncher: defaultSpawnLauncher,
   createClient: (socketPath) => new HermesChannelClient(socketPath),
@@ -283,6 +357,9 @@ const PRODUCTION_DEPS: PoolDeps = {
   now: () => Date.now(),
   isPidAlive: defaultIsPidAlive,
   killByName: defaultKillByName,
+  listSocketHolderPids: defaultListSocketHolderPids,
+  getPpid: defaultGetPpid,
+  getCommandLine: defaultGetCommandLine,
 };
 
 // ---------------------------------------------------------------------------
@@ -340,6 +417,19 @@ export class ChannelsSessionPool {
    * Survives eviction so ACP prompt routing remains valid.
    */
   private readonly acpToKey = new Map<string, string>();
+
+  /**
+   * Review item 1 (race fix): socket paths currently being spawned, i.e.
+   * reserved BEFORE spawnLauncher() is called and released in a `finally`
+   * once the spawn either lands in `sessions` or fails. Closes the window
+   * where the socket FILE already exists on disk (the launcher/plugin
+   * created it) but `sessions` doesn't have the entry yet (spawn() only
+   * calls `sessions.set()` after `waitForSocket()` resolves) — without
+   * this, reconcileOrphans() ticking during that window would see a
+   * "socket present, not in the Map" session and treat it exactly like a
+   * real orphan, killing a session that is still legitimately being born.
+   */
+  private readonly pendingSpawns = new Set<string>();
 
   private readonly launcherExpPath: string;
   private readonly deps: PoolDeps;
@@ -448,46 +538,57 @@ export class ChannelsSessionPool {
     const noAccountConnectors =
       Boolean(process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"]) &&
       process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] !== "0";
-    const expectPid = this.deps.spawnLauncher(
-      this.launcherExpPath,
-      {
-        HERMES_CHANNEL_SOCKET: socketPath,
-        HERMES_SESSION_NAME: sessionName,
-        // Persona/sandbox cwd: explicit env wins so the launcher cd's to the
-        // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
-        // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
-        HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
-        ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
-      },
-      // Gap (c): react the moment this exact child dies, whatever the
-      // cause. expectPid/generation are captured by closure — by the
-      // time this fires (always asynchronously), both `const`s above
-      // have already been assigned, since a real process only exits
-      // after this synchronous call returns.
-      (code) => this.handleUnexpectedExit(sessionKey, generation, expectPid, code)
-    );
 
-    process.stderr.write(
-      `session-pool: spawned expect pid=${expectPid} key=${sessionKey} ` +
-        `socket=${socketPath} name=${sessionName} gen=${generation}\n`
-    );
+    // Review item 1: reserve the socket path BEFORE spawnLauncher() so it's
+    // protected the instant it could possibly appear on disk — released in
+    // `finally` however this turns out (success, waitForSocket timeout, or
+    // any other throw), so a failed spawn doesn't leave a permanent
+    // false-positive "pending" entry blocking reconciliation forever.
+    this.pendingSpawns.add(socketPath);
+    try {
+      const expectPid = this.deps.spawnLauncher(
+        this.launcherExpPath,
+        {
+          HERMES_CHANNEL_SOCKET: socketPath,
+          HERMES_SESSION_NAME: sessionName,
+          // Persona/sandbox cwd: explicit env wins so the launcher cd's to the
+          // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
+          // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
+          HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
+          ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
+        },
+        // Gap (c): react the moment this exact child dies, whatever the
+        // cause. expectPid/generation are captured by closure — by the
+        // time this fires (always asynchronously), both `const`s above
+        // have already been assigned, since a real process only exits
+        // after this synchronous call returns.
+        (code) => this.handleUnexpectedExit(sessionKey, generation, expectPid, code)
+      );
 
-    await waitForSocket(socketPath, SOCKET_WAIT_MS);
+      process.stderr.write(
+        `session-pool: spawned expect pid=${expectPid} key=${sessionKey} ` +
+          `socket=${socketPath} name=${sessionName} gen=${generation}\n`
+      );
 
-    const client = this.deps.createClient(socketPath);
-    const now = this.deps.now();
-    const state: SessionState = {
-      socketPath,
-      expectPid,
-      client,
-      generation,
-      createdAt: now,
-      lastActivityAt: now,
-      sessionName,
-    };
+      await waitForSocket(socketPath, SOCKET_WAIT_MS);
 
-    this.sessions.set(sessionKey, state);
-    return state;
+      const client = this.deps.createClient(socketPath);
+      const now = this.deps.now();
+      const state: SessionState = {
+        socketPath,
+        expectPid,
+        client,
+        generation,
+        createdAt: now,
+        lastActivityAt: now,
+        sessionName,
+      };
+
+      this.sessions.set(sessionKey, state);
+      return state;
+    } finally {
+      this.pendingSpawns.delete(socketPath);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -699,13 +800,18 @@ export class ChannelsSessionPool {
   /**
    * Start the background idle-eviction loop.
    * The interval is .unref()'d so it won't keep the process alive in tests.
+   *
+   * Gap (b): reconcileOrphans() runs on the SAME tick as scanAndEvictIdle —
+   * the in-memory Map scan catches idle sessions THIS process knows about;
+   * the OS-level sweep catches sessions it never knew about (survivors of a
+   * prior, now-dead, instance of this same pool).
    */
   startIdleEviction(): void {
     if (this.evictionTimer !== undefined) return;
-    this.evictionTimer = setInterval(
-      () => void this.scanAndEvictIdle(this.deps.now()),
-      EVICTION_INTERVAL_MS
-    );
+    this.evictionTimer = setInterval(() => {
+      void this.scanAndEvictIdle(this.deps.now());
+      void this.reconcileOrphans();
+    }, EVICTION_INTERVAL_MS);
     this.evictionTimer.unref();
   }
 
@@ -740,6 +846,336 @@ export class ChannelsSessionPool {
         );
         await this.evict(key, false);
       }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // reconcileOrphans — gap (b): OS-level sweep, independent of the Map
+  // --------------------------------------------------------------------------
+
+  /**
+   * Scan THIS INSTANCE's own socket directory ($HERMES_HOME/run/channels)
+   * for ".sock" files not tracked in the in-memory Map, and sweep them.
+   *
+   * Why this is needed: if the WHOLE pool process crashes (not just one
+   * session's child — an abrupt death of the process this class itself
+   * runs in), the replacement process starts with an empty Map. Any
+   * session the dead process had spawned is now a real orphan — still
+   * running, still holding its socket — and completely invisible to
+   * scanAndEvictIdle(), which only ever walks `this.sessions`.
+   *
+   * Safety (deliberately conservative, never a broad process sweep):
+   *   - Scoped to THIS instance's own channels dir via HERMES_HOME — can
+   *     never reach another instance's sockets (e.g. prod's ~/.hermes).
+   *   - NEVER kills by name. An earlier version called `killByName`
+   *     (pkill -f "claude_hermes_<hash8>") here — wrong, because `pkill -f`
+   *     matches by PROCESS COMMAND LINE, machine-wide, with no reference
+   *     to HERMES_HOME or any directory at all. The channels-dir scoping
+   *     above only protects the file-enumeration step; it does nothing to
+   *     stop a name-based pkill from matching an unrelated process on a
+   *     DIFFERENT instance (e.g. prod) that happens to compute the same
+   *     hash8 for a different session_key.
+   *   - Instead, full subtree cleanup (leaf + its ancestors, e.g.
+   *     plugin-bun → claude → expect) is done by `killOrphanAncestry()`:
+   *     climbing from the leaf PID (found via an exact lsof lookup on
+   *     THIS session's own socket path — the one thing we know for
+   *     certain belongs to this exact session) up through `ps`-reported
+   *     parent PIDs, killing each by EXACT PID only, with a per-candidate
+   *     identity check (its own argv, or its parent's, must match this
+   *     session's signature) and a hard stop before ever reaching
+   *     something that looks like this instance's own live supervisor.
+   *     See that method's docstring for the full guard rationale.
+   *
+   * Race (review item 1): a session mid-spawn has its socket file created
+   * on disk BEFORE `sessions.set()` runs (spawn() only sets the Map entry
+   * after `waitForSocket()` resolves) — so a naive Map-only check could
+   * mistake an in-flight spawn for an orphan. Guarded two ways, both
+   * re-checked LIVE per entry (never a pre-loop snapshot, which itself
+   * could go stale while this loop `await`s across iterations):
+   *   - `pendingSpawns` — reserved before spawnLauncher() runs, in case the
+   *     socket file appears before the Map is ever touched.
+   *   - a live scan of `this.sessions` — in case a spawn completes (Map
+   *     updated) WHILE this loop is still running.
+   */
+  async reconcileOrphans(): Promise<void> {
+    const dir = channelSocketsDir();
+
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return; // Directory doesn't exist yet — nothing to reconcile.
+    }
+
+    for (const entry of entries) {
+      if (!entry.endsWith(".sock")) continue;
+
+      const socketPath = join(dir, entry);
+
+      // Live checks — NOT a snapshot taken before the loop (see docstring).
+      if (this.pendingSpawns.has(socketPath)) continue; // mid-spawn.
+      const isTracked = [...this.sessions.values()].some(
+        (s) => s.socketPath === socketPath
+      );
+      if (isTracked) continue; // known, managed session.
+
+      const hash16 = entry.slice(0, -".sock".length);
+      const sessionName = `claude_hermes_${hash16.slice(0, 8)}`;
+
+      const leafPids = this.deps.listSocketHolderPids(socketPath);
+      let anyRefused = false;
+
+      if (leafPids.length === 0) {
+        process.stderr.write(
+          `session-pool: reconcile found untracked socket ${socketPath} ` +
+            `(name=${sessionName}) with no live holder — removing stale file\n`
+        );
+      } else {
+        process.stderr.write(
+          `session-pool: reconcile found untracked socket ${socketPath} ` +
+            `(name=${sessionName}) — walking ancestry from leaf pid(s)=${leafPids.join(",")}\n`
+        );
+        for (const leafPid of leafPids) {
+          const swept = await this.killOrphanAncestry(leafPid, sessionName);
+          if (!swept) anyRefused = true;
+        }
+      }
+
+      // Review item 4 (sibling-supervisor guard): if ANY leaf's ancestry
+      // could not be positively confirmed as a true orphan (reparented to
+      // PID 1 with no live supervisor anywhere above it), do NOT remove
+      // the socket file either — it may still be legitimately in use by a
+      // live sibling supervisor's own tracked session. Only ever unlink
+      // when we're certain: no live holder at all, or every holder's
+      // ancestry was confirmed orphaned and swept.
+      if (anyRefused) {
+        process.stderr.write(
+          `session-pool: reconcile leaving socket ${socketPath} untouched ` +
+            `(name=${sessionName}) — could not confirm true orphan, not removing\n`
+        );
+        continue;
+      }
+
+      if (existsSync(socketPath)) {
+        try { await unlink(socketPath); } catch { /* ignore — already gone */ }
+      }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // killOrphanAncestry — full subtree cleanup for reconcileOrphans, exact
+  // PID only, never by name.
+  // --------------------------------------------------------------------------
+
+  /** Defensive bound on the ancestry walk. Real chain (leaf, plugin-bun wrapper, claude, expect) is 4 hops. */
+  private static readonly ANCESTRY_WALK_MAX_HOPS = 6;
+
+  /**
+   * Climb from a discovered leaf PID (the exact process holding this
+   * session's own socket, per an lsof lookup on its exact path) up
+   * through its process ancestry, killing each verified hop by EXACT PID
+   * only.
+   *
+   * THREE STRICTLY SEPARATE PHASES — discover, then verify, then kill.
+   * Empirically discovered why this separation is required (not a
+   * style preference): killing the leaf can have a side effect where an
+   * intermediate process (e.g. the hermes-channel plugin's own bun
+   * wrapper, whose job is `bun install && bun server.ts`) naturally exits
+   * shortly after ITS OWN child (the leaf) is killed — completely
+   * independent of anything this method does to IT directly. An earlier,
+   * interleaved version of this walk (discover-a-hop, verify-it,
+   * kill-it, repeat) queried each node's ppid/cmdline lazily, one hop at
+   * a time — so by the time it reached the wrapper hop, the wrapper had
+   * ALREADY died as a side effect of the leaf's own kill (still inside
+   * the leaf's SIGTERM grace wait), and `ps` can no longer report a dead
+   * PID's ppid/cmdline at all. That made a REAL identity match (the
+   * wrapper's true parent, `claude`, genuinely matched `sessionName`)
+   * look like a failure, and the walk stopped early — reproduced live
+   * against a real spawned session (`scratch/ja25-ancestry-walk-demo.ts`)
+   * before this fix. Discovering the whole chain FIRST (pure `ps` reads,
+   * no kills in between) means every lookup happens while the chain is
+   * still fully intact, so a later kill's side effects can never corrupt
+   * an earlier verification decision.
+   *
+   * Phase 1 (discover): walk from the leaf upward via `getPpid`,
+   * recording each PID's command line, until PID 1 (natural top of an
+   * orphaned tree), the max hop bound, or this instance's own live
+   * supervisor (never even added to the chain — see below).
+   *
+   * Phase 2 (verify): the leaf (index 0) is pre-verified — it was found
+   * via an exact-path lsof match on THIS session's own deterministic
+   * socket, so nothing else could hold that fd. Every ancestor beyond the
+   * leaf must either match this session's own signature directly (its
+   * argv contains `sessionName`, i.e. it's `claude`, or contains this
+   * instance's own `launcherExpPath`, i.e. it's `expect`) OR have a
+   * PARENT (in the discovered chain, not a live re-query) that matches
+   * one of those. That second clause covers the one intermediate hop in
+   * the real tree — the plugin's bun wrapper, whose own argv carries no
+   * session-specific string. The first node matching neither ends the
+   * trusted prefix — under-killing is always preferred over killing an
+   * unverified process.
+   *
+   * Phase 3 (kill): every node in the trusted prefix gets the SAME
+   * SIGTERM → grace → SIGKILL-if-survived escalation as evict() (reusing
+   * the same named grace constants) via `killPidWithGraceEscalation` — a
+   * separate helper from evict()'s own inline sequence, deliberately not
+   * shared, so this addition can never alter evict()'s already-shipped,
+   * already-tested behavior. Killing a node that already died naturally
+   * (e.g. the wrapper, per the mechanism above) is a safe no-op —
+   * killPid/isPidAlive already tolerate an absent PID.
+   *
+   * Review item 4 — sibling-supervisor guard. reconcileOrphans()'s whole
+   * premise is "untracked in THIS process's Map == the owning supervisor
+   * is dead." That's false when TWO supervisor processes share the same
+   * HERMES_HOME (observed live on this box, ordinary multi-session
+   * behavior per the Python-side ACP client transport) — if their Maps
+   * ever diverge on a key (near-guaranteed: they're separate processes
+   * with separate Maps, nothing synchronizes them), instance A's reconcile
+   * tick would see instance B's perfectly live, legitimately-owned session
+   * as "untracked" and, without this guard, kill it out from under B.
+   *
+   * The fix: a subtree is trusted as a genuine orphan ONLY when discovery
+   * positively reaches PID 1 (the kernel's actual reparent target — the
+   * one unambiguous proof nothing alive still owns it). Any other reason
+   * discovery stops — hitting a live process that looks like a supervisor
+   * (this instance's own, or ANY sibling's: both run the identical
+   * acp_entrypoint.ts from the identical path under this same HERMES_HOME,
+   * so they're indistinguishable by argv, and there is no need to tell
+   * them apart — either way something alive still owns this subtree), the
+   * hop bound, or a broken mid-walk lookup — means "not positively
+   * confirmed dead," and the ENTIRE subtree is left alone, not just the
+   * ancestor where discovery stopped. Returns false in that case so
+   * reconcileOrphans() also knows not to remove the socket file.
+   *
+   * @returns true if the subtree was confirmed a true orphan and swept
+   *          (or partially swept, per the identity guard within Phase 2/3);
+   *          false if the walk refused to touch it at all.
+   */
+  private async killOrphanAncestry(
+    leafPid: number,
+    sessionName: string
+  ): Promise<boolean> {
+    // --- Phase 1: discover (pure reads, no kills) -------------------------
+    const chainPids: number[] = [];
+    const chainCmdlines: Array<string | undefined> = [];
+    let currentPid: number | undefined = leafPid;
+    let confirmedOrphan = false; // only true if we positively reach PID 1
+
+    for (
+      let hop = 0;
+      hop < ChannelsSessionPool.ANCESTRY_WALK_MAX_HOPS && currentPid !== undefined;
+      hop++
+    ) {
+      const cmdline = this.deps.getCommandLine(currentPid);
+
+      if (this.looksLikeSupervisorCmdline(cmdline)) {
+        process.stderr.write(
+          `session-pool: reconcile ancestry discovery stopped at pid=${currentPid} ` +
+            `(name=${sessionName}) — matches a live supervisor (this instance's own, ` +
+            `or a sibling sharing this HERMES_HOME) — NOT a confirmed orphan\n`
+        );
+        break; // never added to the chain — never a kill candidate.
+      }
+
+      chainPids.push(currentPid);
+      chainCmdlines.push(cmdline);
+
+      const ppid = this.deps.getPpid(currentPid);
+      if (ppid === 1) {
+        confirmedOrphan = true; // positively reparented to init — genuine orphan.
+        break;
+      }
+      if (ppid === undefined) break; // process vanished mid-walk — ambiguous, not confirmed.
+      currentPid = ppid;
+    }
+
+    if (!confirmedOrphan) {
+      process.stderr.write(
+        `session-pool: reconcile ancestry walk for leaf=${leafPid} (name=${sessionName}) ` +
+          `did NOT positively confirm a true orphan (no live supervisor found above it, ` +
+          `and reparenting to PID 1 was never observed) — refusing to touch this subtree\n`
+      );
+      return false;
+    }
+
+    // --- Phase 2: verify (pure logic over the static snapshot above) -----
+    let trustedCount = 0;
+    for (let i = 0; i < chainPids.length; i++) {
+      if (i === 0) {
+        trustedCount = 1; // leaf: pre-verified by the exact-path lsof lookup that found it.
+        continue;
+      }
+      const selfMatches = this.matchesSignature(chainCmdlines[i], sessionName);
+      const parentCmdline = i + 1 < chainCmdlines.length ? chainCmdlines[i + 1] : undefined;
+      const parentMatches = this.matchesSignature(parentCmdline, sessionName);
+      if (!selfMatches && !parentMatches) {
+        process.stderr.write(
+          `session-pool: reconcile ancestry walk stopped at pid=${chainPids[i]} — ` +
+            `no identity match for name=${sessionName}\n`
+        );
+        break;
+      }
+      trustedCount = i + 1;
+    }
+
+    // --- Phase 3: kill the verified prefix, leaf first --------------------
+    for (let i = 0; i < trustedCount; i++) {
+      await this.killPidWithGraceEscalation(
+        chainPids[i],
+        `reconcile ancestry hop=${i} name=${sessionName}`
+      );
+    }
+
+    return true;
+  }
+
+  /**
+   * Does this command line look like a live acp_entrypoint supervisor
+   * process — this instance's own, or a sibling's? Both run the identical
+   * acp_entrypoint.ts from the identical path under a shared HERMES_HOME,
+   * so they are indistinguishable by argv alone, and (per the
+   * sibling-supervisor guard above) there is no need to tell them apart —
+   * either way, something alive still owns whatever is above this point.
+   */
+  private looksLikeSupervisorCmdline(cmdline: string | undefined): boolean {
+    if (!cmdline) return false;
+    const acpEntrypointHint = join(
+      dirname(this.launcherExpPath),
+      "src",
+      "acp_entrypoint.ts"
+    );
+    return cmdline.includes(acpEntrypointHint);
+  }
+
+  /** Does this command line match this session's own signature? */
+  private matchesSignature(cmdline: string | undefined, sessionName: string): boolean {
+    if (!cmdline) return false;
+    return cmdline.includes(sessionName) || cmdline.includes(this.launcherExpPath);
+  }
+
+  /**
+   * SIGTERM -> grace -> verify -> SIGKILL-if-survived -> grace -> verify.
+   * Never falls back to a name-based kill (unlike evict()'s last resort)
+   * — if a candidate survives even SIGKILL here, it's logged and left
+   * alone rather than escalating to an unscoped primitive.
+   */
+  private async killPidWithGraceEscalation(
+    pid: number,
+    context: string
+  ): Promise<void> {
+    this.deps.killPid(pid, "SIGTERM");
+    await new Promise<void>((r) => setTimeout(r, EVICT_SIGTERM_GRACE_MS));
+    if (!this.deps.isPidAlive(pid)) return;
+
+    process.stderr.write(
+      `session-pool: pid=${pid} survived SIGTERM (${context}) — escalating to SIGKILL\n`
+    );
+    this.deps.killPid(pid, "SIGKILL");
+    await new Promise<void>((r) => setTimeout(r, EVICT_SIGKILL_GRACE_MS));
+    if (this.deps.isPidAlive(pid)) {
+      process.stderr.write(
+        `session-pool: pid=${pid} survived SIGKILL (${context}) — giving up on this PID\n`
+      );
     }
   }
 

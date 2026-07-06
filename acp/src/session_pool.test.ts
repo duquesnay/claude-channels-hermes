@@ -23,9 +23,9 @@ import {
 } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:net";
-import { unlinkSync, existsSync } from "node:fs";
+import { unlinkSync, existsSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import {
   ChannelsSessionPool,
@@ -113,7 +113,7 @@ async function makePool(opts: {
   const fakeServers = new Map<string, Server>();
   const nowValue = { value: Date.now() };
 
-  const deps: PoolDeps = {
+  const deps: Partial<PoolDeps> = {
     spawnLauncher(_launcherExpPath, env) {
       const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
       const name = env["HERMES_SESSION_NAME"]!;
@@ -257,7 +257,7 @@ describe("generation token on respawn", () => {
     const fakeServers = new Map<string, Server>();
 
     let callCount = 0;
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -414,7 +414,7 @@ describe("capacity cap", () => {
 
     const fakeServers = new Map<string, Server>();
     let callCount = 0;
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -458,7 +458,7 @@ describe("capacity cap", () => {
 
     const fakeServers = new Map<string, Server>();
     let callCount = 0;
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -503,7 +503,7 @@ describe("graceful drain on evict", () => {
     // Client drains after 150ms
     const drainingClient = makeDrainingClient(1, 150);
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -548,7 +548,7 @@ describe("scoped kill assertion", () => {
     const fakeServers = new Map<string, Server>();
     const EXPECTED_PID = 54321;
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -592,7 +592,7 @@ describe("scoped kill assertion", () => {
     const fakeServers = new Map<string, Server>();
     const EXPECTED_PID = 54322;
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -627,6 +627,463 @@ describe("scoped kill assertion", () => {
   // Satisfy TypeScript — afterEach reference
   let fake: FakeDeps;
   afterEach(async () => { await fake?.cleanup(); });
+});
+
+// ---------------------------------------------------------------------------
+// OS-level orphan reconciliation (gap b)
+//
+// scanAndEvictIdle() only ever walks the pool's OWN in-memory Map. A parent
+// process that crashed and got respawned starts with an EMPTY Map — any
+// session it doesn't know about (an orphan surviving from before the crash)
+// is invisible to it forever. reconcileOrphans() closes that blind spot by
+// scanning THIS INSTANCE's own socket directory ($HERMES_HOME/run/channels)
+// for untracked ".sock" files and sweeping them with the same scoped,
+// exact-target primitives evict() already uses (killSocketHolders by exact
+// path, killByName by the hash-derived scoped session name) — never a bare
+// process-name pattern, and never anything outside this instance's own
+// socket dir (so it can never reach a different HERMES_HOME, e.g. prod).
+// ---------------------------------------------------------------------------
+
+describe("reconcileOrphans (gap b)", () => {
+  const ORIGINAL_HERMES_HOME = process.env["HERMES_HOME"];
+  let scratchHome: string;
+
+  beforeEach(() => {
+    // NOTE: deliberately NOT under tmpdir() — macOS's per-user tmp path
+    // (/var/folders/.../T/) is long enough that channels/<16hex>.sock would
+    // blow the 104-byte AF_UNIX path limit the pool itself enforces.
+    scratchHome = `/tmp/jt-${randomUUID().slice(0, 8)}`;
+    process.env["HERMES_HOME"] = scratchHome;
+  });
+
+  afterEach(() => {
+    if (ORIGINAL_HERMES_HOME === undefined) {
+      delete process.env["HERMES_HOME"];
+    } else {
+      process.env["HERMES_HOME"] = ORIGINAL_HERMES_HOME;
+    }
+    if (existsSync(scratchHome)) {
+      rmSync(scratchHome, { recursive: true, force: true });
+    }
+  });
+
+  it("sweeps an untracked socket file (orphan from a crashed prior process) and leaves tracked sessions alone", async () => {
+    const fakeServers = new Map<string, Server>();
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+    const killByNameCalls: string[] = [];
+    const ORPHAN_LEAF_PID = 64500;
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 64001;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore — use listSocketHolderPids + the ancestry walk");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; }, // dies cleanly on SIGTERM — no escalation noise in this test
+      killByName(name) { killByNameCalls.push(name); },
+      listSocketHolderPids(_socketPath) { return [ORPHAN_LEAF_PID]; },
+      getPpid(pid) { return pid === ORPHAN_LEAF_PID ? 1 : undefined; }, // leaf is already the top of the orphaned tree
+      getCommandLine(_pid) { return "/opt/homebrew/bin/bun server.ts"; },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+
+    // One legitimately tracked session — must survive the sweep untouched.
+    const tracked = await pool.getOrCreate("tracked-key");
+    expect(existsSync(tracked.socketPath)).toBe(true);
+
+    // An untracked orphan socket, in the SAME instance's channels dir, that
+    // the pool never spawned in this process's lifetime (simulating a
+    // surviving child from a prior, now-dead, supervisor process). The fake
+    // socket file just needs to exist on disk for readdir()/existsSync() —
+    // the actual "process" being cleaned up is fully mocked via
+    // listSocketHolderPids/getPpid/getCommandLine above.
+    const channelsDir = dirname(tracked.socketPath);
+    const orphanSocketPath = join(channelsDir, "abcdef0123456789.sock");
+    const orphanServer = await startFakeSocket(orphanSocketPath);
+
+    await pool.reconcileOrphans();
+
+    // The orphan's leaf PID was killed via the exact-PID ancestry walk.
+    expect(killPidCalls).toContainEqual({ pid: ORPHAN_LEAF_PID, signal: "SIGTERM" });
+    // Review item 2: killByName must NEVER be called from reconcileOrphans
+    // — pkill -f matches by command line machine-wide, not scoped to this
+    // instance's HERMES_HOME, so it's the one cross-instance kill risk
+    // (e.g. a hash8 collision hitting a live prod session) with no
+    // same-instance benefit (the ancestry walk already reaches every real
+    // process in the chain by exact PID).
+    expect(killByNameCalls.length).toBe(0);
+    // Never swept via the tracked session's own PID.
+    expect(killPidCalls.some((c) => c.pid === tracked.expectPid)).toBe(false);
+
+    // Tracked session untouched.
+    expect(pool.size).toBe(1);
+    expect(existsSync(tracked.socketPath)).toBe(true);
+    expect(existsSync(orphanSocketPath)).toBe(false); // stale file removed
+
+    await stopFakeSocket(orphanServer, orphanSocketPath);
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("kills the FULL live orphan subtree (leaf + plugin wrapper + claude + expect) via exact-PID ancestry walk", async () => {
+    // Reproduces the actual shape observed live: a leaf process (the
+    // plugin's own bun server.ts, found via lsof on the socket) is a
+    // child of an intermediate wrapper (the plugin's "bun run ... start"
+    // process, whose own argv carries no session-specific string), which
+    // is a child of claude (--name claude_hermes_<hash8>), which is a
+    // child of expect (-f <launcherExpPath>), reparented to PID 1.
+    const LEAF_PID = 70501;
+    const WRAPPER_PID = 70502;
+    const CLAUDE_PID = 70503;
+    const EXPECT_PID = 70504;
+    const launcherExpPath = "/fake/launcher.exp";
+    const sessionName = "claude_hermes_deadbeef";
+
+    const ppidMap: Record<number, number> = {
+      [LEAF_PID]: WRAPPER_PID,
+      [WRAPPER_PID]: CLAUDE_PID,
+      [CLAUDE_PID]: EXPECT_PID,
+      [EXPECT_PID]: 1,
+    };
+    const cmdlineMap: Record<number, string> = {
+      [LEAF_PID]: "/opt/homebrew/bin/bun server.ts",
+      [WRAPPER_PID]: "bun run --cwd /some/marketplace/path --shell=bun --silent start",
+      [CLAUDE_PID]: `/Users/x/.local/bin/claude --name ${sessionName} --permission-mode auto`,
+      [EXPECT_PID]: `expect -f ${launcherExpPath}`,
+    };
+
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+    const fakeServers = new Map<string, Server>();
+
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn in this test"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; }, // each hop dies cleanly on SIGTERM
+      killByName(_name) { throw new Error("reconcileOrphans must never call killByName"); },
+      listSocketHolderPids(_socketPath) { return [LEAF_PID]; },
+      getPpid(pid) { return ppidMap[pid]; },
+      getCommandLine(pid) { return cmdlineMap[pid]; },
+    };
+
+    const pool = new ChannelsSessionPool(launcherExpPath, deps);
+
+    // Untracked orphan socket whose filename hashes to "deadbeef" (first 8
+    // hex chars), matching sessionName above.
+    process.env["HERMES_HOME"] = scratchHome;
+    const channelsDir = join(scratchHome, "run", "channels");
+    mkdirSync(channelsDir, { recursive: true });
+    const orphanSocketPath = join(channelsDir, "deadbeef01234567.sock");
+    const orphanServer = await startFakeSocket(orphanSocketPath);
+
+    await pool.reconcileOrphans();
+
+    // Every hop in the real chain was killed by its exact PID.
+    for (const pid of [LEAF_PID, WRAPPER_PID, CLAUDE_PID, EXPECT_PID]) {
+      expect(killPidCalls.some((c) => c.pid === pid && c.signal === "SIGTERM")).toBe(true);
+    }
+    expect(existsSync(orphanSocketPath)).toBe(false);
+
+    await stopFakeSocket(orphanServer, orphanSocketPath);
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("identity guard stops the ancestry walk at an unrelated process instead of killing it", async () => {
+    // The leaf (hop 0) is pre-verified by the exact-path lsof lookup that
+    // found it. Its "parent" here is a totally unrelated process — no
+    // session-specific string in its own argv, and ITS parent doesn't
+    // match this session's signature either. The walk must stop there,
+    // leaving that unrelated process untouched, rather than assuming
+    // everything above a verified node is safe to kill.
+    const LEAF_PID = 70601;
+    const UNRELATED_PID = 70602;
+    const launcherExpPath = "/fake/launcher.exp";
+    const sessionName = "claude_hermes_c0ffee00";
+
+    const ppidMap: Record<number, number> = {
+      [LEAF_PID]: UNRELATED_PID,
+      [UNRELATED_PID]: 1,
+    };
+    const cmdlineMap: Record<number, string> = {
+      [LEAF_PID]: "/opt/homebrew/bin/bun server.ts",
+      [UNRELATED_PID]: "some-totally-unrelated-process --foo --bar",
+      // PID 1 deliberately has no entry — getCommandLine returns undefined.
+    };
+
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn in this test"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; },
+      killByName(_name) { throw new Error("reconcileOrphans must never call killByName"); },
+      listSocketHolderPids(_socketPath) { return [LEAF_PID]; },
+      getPpid(pid) { return ppidMap[pid]; },
+      getCommandLine(pid) { return cmdlineMap[pid]; },
+    };
+
+    const pool = new ChannelsSessionPool(launcherExpPath, deps);
+
+    process.env["HERMES_HOME"] = scratchHome;
+    const channelsDir = join(scratchHome, "run", "channels");
+    mkdirSync(channelsDir, { recursive: true });
+    const orphanSocketPath = join(channelsDir, "c0ffee0089abcdef.sock");
+    const orphanServer = await startFakeSocket(orphanSocketPath);
+
+    await pool.reconcileOrphans();
+
+    // The pre-verified leaf WAS killed...
+    expect(killPidCalls.some((c) => c.pid === LEAF_PID)).toBe(true);
+    // ...but the walk stopped before touching the unrelated ancestor —
+    // it matches neither `sessionName` nor `launcherExpPath`, and ITS OWN
+    // parent (PID 1, no known cmdline) doesn't either.
+    expect(killPidCalls.some((c) => c.pid === UNRELATED_PID)).toBe(false);
+    void sessionName; // documents the fixture's derivation; not asserted on directly
+
+    await stopFakeSocket(orphanServer, orphanSocketPath);
+  });
+
+  it("refuses to touch a subtree still owned by a LIVE SIBLING supervisor sharing this HERMES_HOME (review item 4)", async () => {
+    // reconcileOrphans()'s whole premise is "untracked in THIS process's
+    // Map == the owning supervisor is dead." That's false when two
+    // supervisor processes share the same HERMES_HOME (observed live —
+    // multiple concurrent acp_entrypoint subprocesses back distinct
+    // Python-side avatar/API sessions under ONE gateway). Their Maps are
+    // never synchronized, so instance A's reconcile tick can see a
+    // perfectly live session it never spawned as "untracked." Here the
+    // ancestry walk reaches a live process matching the acp_entrypoint
+    // signature (the sibling's supervisor) INSTEAD of reaching PID 1 —
+    // the walk must refuse the WHOLE subtree, not just skip that one
+    // ancestor, and must NOT remove the socket file either (still legitimately
+    // in use by the sibling).
+    const LEAF_PID = 70701;
+    const WRAPPER_PID = 70702;
+    const CLAUDE_PID = 70703;
+    const EXPECT_PID = 70704;
+    const SIBLING_SUPERVISOR_PID = 70705; // ALIVE — expect's real parent, not PID 1
+    const launcherExpPath = "/fake/launcher.exp";
+    const sessionName = "claude_hermes_5ib1ing0";
+
+    const ppidMap: Record<number, number> = {
+      [LEAF_PID]: WRAPPER_PID,
+      [WRAPPER_PID]: CLAUDE_PID,
+      [CLAUDE_PID]: EXPECT_PID,
+      [EXPECT_PID]: SIBLING_SUPERVISOR_PID, // NOT 1 — still has a live parent!
+      [SIBLING_SUPERVISOR_PID]: 1,
+    };
+    const cmdlineMap: Record<number, string> = {
+      [LEAF_PID]: "/opt/homebrew/bin/bun server.ts",
+      [WRAPPER_PID]: "bun run --cwd /some/marketplace/path --shell=bun --silent start",
+      [CLAUDE_PID]: `/Users/x/.local/bin/claude --name ${sessionName} --permission-mode auto`,
+      [EXPECT_PID]: `expect -f ${launcherExpPath}`,
+      // Matches the SAME acp_entrypoint.ts path this pool instance itself
+      // uses — indistinguishable from "this instance's own supervisor",
+      // which is exactly the point: a sibling running the identical code
+      // under the identical HERMES_HOME looks identical by argv.
+      [SIBLING_SUPERVISOR_PID]: "/opt/homebrew/bin/bun run /fake/src/acp_entrypoint.ts",
+    };
+
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn in this test"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) { throw new Error("reconcileOrphans must never call killByName"); },
+      listSocketHolderPids(_socketPath) { return [LEAF_PID]; },
+      getPpid(pid) { return ppidMap[pid]; },
+      getCommandLine(pid) { return cmdlineMap[pid]; },
+    };
+
+    const pool = new ChannelsSessionPool(launcherExpPath, deps);
+
+    process.env["HERMES_HOME"] = scratchHome;
+    const channelsDir = join(scratchHome, "run", "channels");
+    mkdirSync(channelsDir, { recursive: true });
+    const orphanSocketPath = join(channelsDir, "5ib1ing089abcdef.sock");
+    const orphanServer = await startFakeSocket(orphanSocketPath);
+
+    await pool.reconcileOrphans();
+
+    // NOTHING was killed — not even the pre-verified leaf. A subtree with
+    // ANY live parent above it (not positively reparented to PID 1) is not
+    // a confirmed orphan, full stop.
+    for (const pid of [LEAF_PID, WRAPPER_PID, CLAUDE_PID, EXPECT_PID, SIBLING_SUPERVISOR_PID]) {
+      expect(killPidCalls.some((c) => c.pid === pid)).toBe(false);
+    }
+    // The socket file was left in place too — it may still be in active use.
+    expect(existsSync(orphanSocketPath)).toBe(true);
+
+    await stopFakeSocket(orphanServer, orphanSocketPath);
+  });
+
+  it("regression: a genuinely dead-owner orphan (reparented to PID 1) is still fully swept, sibling-guard notwithstanding", async () => {
+    // Same 4-level chain as the "kills the FULL live orphan subtree" test,
+    // re-asserted here explicitly as the regression guard for review item
+    // 4 — the sibling-supervisor guard must NEVER cause a false negative
+    // on the ordinary, most-common case: a subtree whose ancestry
+    // positively reaches PID 1 (no live parent anywhere) must still be
+    // fully killed, exactly as before this review round.
+    const LEAF_PID = 70801;
+    const WRAPPER_PID = 70802;
+    const CLAUDE_PID = 70803;
+    const EXPECT_PID = 70804;
+    const launcherExpPath = "/fake/launcher.exp";
+    const sessionName = "claude_hermes_dead0wne"; // first 8 chars of the 16-char socket hash below
+
+    const ppidMap: Record<number, number> = {
+      [LEAF_PID]: WRAPPER_PID,
+      [WRAPPER_PID]: CLAUDE_PID,
+      [CLAUDE_PID]: EXPECT_PID,
+      [EXPECT_PID]: 1, // positively reparented to init — genuine orphan
+    };
+    const cmdlineMap: Record<number, string> = {
+      [LEAF_PID]: "/opt/homebrew/bin/bun server.ts",
+      [WRAPPER_PID]: "bun run --cwd /some/marketplace/path --shell=bun --silent start",
+      [CLAUDE_PID]: `/Users/x/.local/bin/claude --name ${sessionName} --permission-mode auto`,
+      [EXPECT_PID]: `expect -f ${launcherExpPath}`,
+    };
+
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn in this test"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; },
+      killByName(_name) { throw new Error("reconcileOrphans must never call killByName"); },
+      listSocketHolderPids(_socketPath) { return [LEAF_PID]; },
+      getPpid(pid) { return ppidMap[pid]; },
+      getCommandLine(pid) { return cmdlineMap[pid]; },
+    };
+
+    const pool = new ChannelsSessionPool(launcherExpPath, deps);
+
+    process.env["HERMES_HOME"] = scratchHome;
+    const channelsDir = join(scratchHome, "run", "channels");
+    mkdirSync(channelsDir, { recursive: true });
+    const orphanSocketPath = join(channelsDir, "dead0wne01234567.sock"); // 16 hex-ish chars -> hash8 = "dead0wne"
+    const orphanServer = await startFakeSocket(orphanSocketPath);
+
+    await pool.reconcileOrphans();
+
+    for (const pid of [LEAF_PID, WRAPPER_PID, CLAUDE_PID, EXPECT_PID]) {
+      expect(killPidCalls.some((c) => c.pid === pid && c.signal === "SIGTERM")).toBe(true);
+    }
+    expect(existsSync(orphanSocketPath)).toBe(false);
+
+    await stopFakeSocket(orphanServer, orphanSocketPath);
+  });
+
+  it("does NOT sweep a session that is still mid-spawn (socket exists on disk, Map not yet updated) — review item 1", async () => {
+    // The exact race: spawn() only calls this.sessions.set(...) AFTER
+    // waitForSocket() resolves, but the socket FILE can appear on disk
+    // well before that (the launcher/plugin creates it; waitForSocket just
+    // polls for it). If reconcileOrphans() ticks in that window, the
+    // in-flight session looks exactly like an orphan — same-Map-absence,
+    // same disk-presence — and would get killed out from under a session
+    // that is still legitimately being created.
+    const fakeServers = new Map<string, Server>();
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+
+    const deps: PoolDeps = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        // Delay the fake socket's creation so there's a real window where
+        // the file exists on disk but getOrCreate() hasn't returned yet.
+        setTimeout(() => {
+          void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        }, 250);
+        return 70001;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {
+        throw new Error("reconcileOrphans must not call killSocketHolders anymore");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+      listSocketHolderPids(_socketPath) {
+        throw new Error("must not even look for holders — the pendingSpawns/isTracked guard must skip this entry entirely");
+      },
+      getPpid(_pid) { return undefined; },
+      getCommandLine(_pid) { return undefined; },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const key = "in-flight-key";
+
+    const spawnPromise = pool.getOrCreate(key);
+
+    // Land inside the (250ms socket-created, ~500ms default-poll-notices)
+    // window: file exists, Map entry does not yet.
+    await new Promise((r) => setTimeout(r, 350));
+    await pool.reconcileOrphans();
+
+    expect(killPidCalls.length).toBe(0);
+
+    const state = await spawnPromise; // let the spawn complete normally
+    expect(state).toBeDefined();
+    expect(pool.size).toBe(1);
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("is a no-op when the channels directory does not exist yet", async () => {
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {
+        throw new Error("should not be called — nothing to reconcile");
+      },
+      killSocketHolders(_socketPath) {
+        throw new Error("should not be called — nothing to reconcile");
+      },
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {
+        throw new Error("should not be called — nothing to reconcile");
+      },
+      listSocketHolderPids(_socketPath) {
+        throw new Error("should not be called — nothing to reconcile");
+      },
+      getPpid(_pid) { return undefined; },
+      getCommandLine(_pid) { return undefined; },
+    };
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await expect(pool.reconcileOrphans()).resolves.toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -912,7 +1369,7 @@ describe("idle eviction", () => {
     const fakeServers = new Map<string, Server>();
     const nowValue = { value: Date.now() };
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -952,7 +1409,7 @@ describe("idle eviction", () => {
     const fakeServers = new Map<string, Server>();
     const nowValue = { value: Date.now() };
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -999,7 +1456,7 @@ describe("HERMES_CHANNELS_MIN_WARM", () => {
     const fakeServers = new Map<string, Server>();
     const nowValue = { value: Date.now() };
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -1051,7 +1508,7 @@ describe("HERMES_CHANNELS_MIN_WARM", () => {
     const fakeServers = new Map<string, Server>();
     const nowValue = { value: 1_000_000 }; // fixed start — deterministic
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
         void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
@@ -1120,7 +1577,7 @@ describe("HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS", () => {
     const fakeServers = new Map<string, Server>();
     const spawnedEnvs: Record<string, string>[] = [];
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         spawnedEnvs.push(env);
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
@@ -1159,7 +1616,7 @@ describe("HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS", () => {
     const fakeServers = new Map<string, Server>();
     const spawnedEnvs: Record<string, string>[] = [];
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         spawnedEnvs.push(env);
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
@@ -1196,7 +1653,7 @@ describe("HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS", () => {
     const fakeServers = new Map<string, Server>();
     const spawnedEnvs: Record<string, string>[] = [];
 
-    const deps: PoolDeps = {
+    const deps: Partial<PoolDeps> = {
       spawnLauncher(_launcherExpPath, env) {
         spawnedEnvs.push(env);
         const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
