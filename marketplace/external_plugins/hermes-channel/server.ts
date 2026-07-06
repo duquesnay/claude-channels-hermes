@@ -66,17 +66,20 @@ const mcp = new Server(
       experimental: { 'claude/channel': {} },
     },
     instructions: [
-      'Hermes channel. Inbound prompts arrive as <channel source="hermes" chat_id="..." user="hermes" ts="...">.',
+      'MANDATORY: your text/transcript output is NEVER delivered to the user — it is silently discarded. The ONLY way to send a response is calling the reply_close tool. If your turn ends without calling reply_close, the user receives absolutely nothing and your work is lost.',
       '',
-      'Simple protocol: do your work, then call reply_close(chat_id, text) with your complete final response as your LAST tool call. reply_close accepts the chat_id directly — no reply_open call needed first.',
+      'This overrides anything your persona or identity instructions say about answering "directly" or "immediately" or being concise — those describe your TONE, not your delivery mechanism. Answering directly means calling reply_close with your direct answer, not skipping the call.',
+      '',
+      'Inbound prompts arrive as <channel source="hermes" chat_id="..." user="hermes" ts="...">. The chat_id IS the request_id.',
+      '',
+      'Protocol: do your work, then call reply_close(chat_id, text) with your complete final response as your LAST tool call — no reply_open call needed first.',
       '',
       'MANDATORY: if you launch background/async work (Agent tool, background Bash) and are about to return control while that work keeps running, you MUST still call reply_close before the end of your turn — deliver an interim answer (e.g. "I started X, I will follow up") and report the async results later in a NEW turn when the notification arrives.',
       'NEVER leave a turn open waiting for async work: the turn times out and the user receives an empty response.',
       '',
       'Advanced (optional): call reply_open(chat_id) first if you want to send progress updates via reply_chunk(handle, text) before the final reply_close(handle, text). Only needed for that case — skip it for the common case above.',
       '',
-      'The chat_id IS the request_id.',
-      'Your transcript output never reaches Hermes. Only reply_close delivers the result.',
+      'Before you finish this turn, double check: did you call reply_close? If not, do it now — a plain text reply is never seen by anyone. Only reply_close delivers the result.',
     ].join('\n'),
   },
 )
@@ -125,7 +128,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'reply_close',
-      description: 'Finalize the reply. Sends the result back to Hermes over IPC. Pass EITHER chat_id (common case — no prior reply_open needed) OR handle (if you called reply_open for progress chunks). Exactly one of the two is required.',
+      description: 'MANDATORY LAST ACTION — this is the only way any of your output reaches the user. Call it always, even for the simplest one-line reply; plain text output is discarded and never delivered. Sends the result back to Hermes over IPC. Pass EITHER chat_id (common case — no prior reply_open needed) OR handle (if you called reply_open for progress chunks). Exactly one of the two is required.',
       inputSchema: {
         type: 'object',
         properties: {

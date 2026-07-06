@@ -62,4 +62,70 @@ describe('hermes-channel MCP instructions', () => {
     // comes back with it.
     expect(instructions).not.toMatch(/reply_open MUST be your very first tool call/)
   })
+
+  // JA-24 v2: a prod incident showed a heavy-persona (~8k char CLAUDE.md)
+  // haiku worker responding with plain assistant text and ZERO tool calls —
+  // it never saw the v1 wording ("Simple protocol: do your work, then call
+  // reply_close...") as a hard requirement, just a description. Live
+  // repro on janet-test (heavy persona + --model haiku, 10 real turns)
+  // reproduced the same skip at ~40% before this hardening. These tests
+  // guard the strengthened wording; the actual pass/fail bar is empirical
+  // (10/10 real turns calling reply_close), tracked in the mission report,
+  // not by these text assertions alone.
+  test('states plainly, as the opening MANDATORY line, that text/transcript output is never delivered', () => {
+    const instructions = extractInstructions()
+    const firstLine = instructions.split('\n').find(l => l.trim().length > 0)
+
+    expect(firstLine).toMatch(/MANDATORY/)
+    expect(firstLine!.toLowerCase()).toMatch(/never.*delivered|discarded/)
+    expect(firstLine).toMatch(/reply_close/)
+  })
+
+  test('reminds the model at the very end of the instructions to confirm reply_close was called', () => {
+    const instructions = extractInstructions()
+    const lines = instructions.split('\n').filter(l => l.trim().length > 0)
+    const lastLine = lines[lines.length - 1]
+
+    // Recency, not just primacy — a weak model skimming a long persona
+    // context may only reliably attend to the start and end of the tool
+    // instructions block.
+    expect(lastLine.toLowerCase()).toMatch(/reply_close/)
+  })
+
+  // JA-24 v2 round 2: 20/20 heavy-persona repro turns still skipped at ~20%
+  // after the first hardening pass. Hypothesis: a heavy persona (e.g. "answer
+  // completely and immediately") reads to a weak model as permission to
+  // answer in plain text — a style instruction, not a delivery-mechanism one
+  // — and that competes with the MCP instructions above. This test guards an
+  // explicit line disarming that conflict.
+  test('explicitly overrides persona/identity instructions about answering directly or immediately', () => {
+    const instructions = extractInstructions()
+
+    expect(instructions.toLowerCase()).toMatch(/persona|identity/)
+    expect(instructions.toLowerCase()).toMatch(/directly|immediately/)
+    expect(instructions).toMatch(/reply_close/)
+  })
+})
+
+describe('hermes-channel MCP tool descriptions', () => {
+  function extractToolsSourceBlock(): string {
+    const source = readFileSync(join(import.meta.dir, 'server.ts'), 'utf8')
+    const start = source.indexOf('mcp.setRequestHandler(ListToolsRequestSchema')
+    const end = source.indexOf('// ====', start + 1)
+    if (start === -1 || end === -1) throw new Error('could not locate ListTools handler block')
+    return source.slice(start, end)
+  }
+
+  test('reply_close tool description says it is mandatory and the only delivery mechanism', () => {
+    const block = extractToolsSourceBlock()
+    const idx = block.indexOf("name: 'reply_close'")
+    expect(idx).toBeGreaterThan(-1)
+    // reply_close is the last tool defined in the array, so slicing to the
+    // end of the block is safe — if that ordering ever changes, this test
+    // will need a proper end-of-tool-object boundary instead.
+    const replyCloseBlock = block.slice(idx)
+
+    expect(replyCloseBlock.toLowerCase()).toMatch(/mandatory|required/)
+    expect(replyCloseBlock.toLowerCase()).toMatch(/only way|discarded|never.*delivered/)
+  })
 })
