@@ -25,6 +25,7 @@ import {
   sessionDecision,
   waitForSocket,
   isSocket,
+  isSocketLive,
 } from "./supervisor.ts";
 
 // ---------------------------------------------------------------------------
@@ -183,6 +184,79 @@ describe("waitForSocket", () => {
     } finally {
       clearTimeout(createDelay);
       if (server) await stopServer(server, socketPath);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isSocketLive — gap (d): a socket-type FILE is not proof of a live LISTENER.
+//
+// isSocket() only checks the inode type (fs.Stat.isSocket()) — a dangling
+// socket file left behind by a process that died without calling
+// server.close() (e.g. SIGKILL) still passes that check even though nothing
+// is listening. isSocketLive() attempts a real connection and treats
+// ECONNREFUSED / any connect error as "not live".
+// ---------------------------------------------------------------------------
+
+describe("isSocketLive", () => {
+  it("resolves true for a live Unix socket with an active listener", async () => {
+    const socketPath = tempSocketPath();
+    const server = await startTempSocket(socketPath);
+    try {
+      await expect(isSocketLive(socketPath)).resolves.toBe(true);
+    } finally {
+      await stopServer(server, socketPath);
+    }
+  });
+
+  it("resolves false for a path that does not exist", async () => {
+    await expect(
+      isSocketLive("/tmp/does-not-exist-supervisor-live-test.sock")
+    ).resolves.toBe(false);
+  });
+
+  it("resolves false for a regular file (not a socket)", async () => {
+    const filePath = tempFilePath();
+    writeFileSync(filePath, "not a socket");
+    try {
+      await expect(isSocketLive(filePath)).resolves.toBe(false);
+    } finally {
+      try { unlinkSync(filePath); } catch { /* ignore */ }
+    }
+  });
+
+  it("resolves false for a DANGLING socket file — type=socket but no live listener (the actual JA-25 gap)", async () => {
+    // Reproduce the real bug shape: a process that held a live listener on
+    // this path was killed with SIGKILL (uncatchable — no server.close(),
+    // so the socket file is NOT unlinked and survives on disk as a real
+    // socket-type file). isSocket() would misreport this as "present";
+    // isSocketLive() must not.
+    const socketPath = tempSocketPath();
+    const proc = Bun.spawn(
+      ["bun", "-e", `require("net").createServer(()=>{}).listen(${JSON.stringify(socketPath)})`],
+      { stdout: "ignore", stderr: "ignore", stdin: "ignore" }
+    );
+    try {
+      // Wait for the socket file to actually appear before killing it.
+      const deadline = Date.now() + 5000;
+      while (!existsSync(socketPath)) {
+        if (Date.now() > deadline) throw new Error("socket never appeared in helper process");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+
+      proc.kill("SIGKILL"); // uncatchable — no cleanup handler runs
+      await proc.exited;
+
+      // Sanity: the dangling file is still there and still LOOKS like a socket.
+      expect(existsSync(socketPath)).toBe(true);
+      expect(isSocket(socketPath)).toBe(true);
+
+      // The real fix: a connection attempt must reveal nobody is listening.
+      await expect(isSocketLive(socketPath)).resolves.toBe(false);
+    } finally {
+      if (existsSync(socketPath)) {
+        try { unlinkSync(socketPath); } catch { /* ignore */ }
+      }
     }
   });
 });

@@ -12,6 +12,7 @@
  */
 
 import { statSync } from "node:fs";
+import { createConnection } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -55,6 +56,48 @@ export function isSocket(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** Timeout for a live-listener connect probe (isSocketLive). */
+const LIVE_CHECK_TIMEOUT_MS = 1_000;
+
+/**
+ * Verify a Unix socket path has an ACTUAL LIVE LISTENER, not just a
+ * socket-type file on disk.
+ *
+ * Gap (d): a process that dies without calling server.close() (SIGKILL,
+ * crash) leaves its socket file behind — isSocket() still reports it as
+ * "present" (correct file type), but nothing is listening on it anymore.
+ * Reusing such a session (sessionDecision would say "reuse" on
+ * socketPresent=true) would hand the caller a dead connection. This does a
+ * real connect() and treats any failure (ECONNREFUSED, ENOENT, timeout) as
+ * "not live" — only a successful connection counts.
+ */
+export function isSocketLive(
+  path: string,
+  timeoutMs: number = LIVE_CHECK_TIMEOUT_MS
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    if (!isSocket(path)) {
+      resolve(false);
+      return;
+    }
+
+    let settled = false;
+    const finish = (result: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const socket = createConnection(path);
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
 }
 
 /**

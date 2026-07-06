@@ -42,7 +42,7 @@ import { join, dirname } from "node:path";
 import { mkdir, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import {
-  isSocket,
+  isSocketLive,
   waitForSocket,
   sessionDecision,
 } from "./supervisor.ts";
@@ -83,6 +83,22 @@ const DRAIN_TIMEOUT_MS = 30_000;
 /** Idle eviction scan interval — use .unref() so it doesn't block test exit. */
 const EVICTION_INTERVAL_MS = 60_000;
 
+/**
+ * Review item 3 (empirically gauged, not guessed): grace period after
+ * SIGTERM before evict() checks isPidAlive(expectPid) and possibly
+ * escalates to SIGKILL. Measured against a real spawned session
+ * (`scratch/ja25-cascade-probe.ts`): the `expect` process itself died at
+ * +53ms after SIGTERM — comfortably inside this window — so escalation to
+ * SIGKILL is the EXCEPTION (a genuinely stuck/unresponsive process), not
+ * something that fires almost every time. Kept at 500ms rather than
+ * shortened or lengthened based on that single measurement; revisit with
+ * more data if escalation logs turn out to be frequent in practice.
+ */
+const EVICT_SIGTERM_GRACE_MS = 500;
+
+/** Grace period after the SIGKILL escalation before the final isPidAlive check. */
+const EVICT_SIGKILL_GRACE_MS = 200;
+
 // ---------------------------------------------------------------------------
 // Session state
 // ---------------------------------------------------------------------------
@@ -108,10 +124,19 @@ export interface PoolDeps {
   /**
    * Spawn the expect launcher; return the PID of the expect process.
    * Receives the environment variables to inject into the subprocess.
+   *
+   * @param onExit  Gap (c): optional callback invoked with the child's exit
+   *                code as soon as it dies, for ANY reason (crash, SIGKILL
+   *                from outside, normal exit) — not just when the pool
+   *                itself initiated the kill. Lets the pool learn about an
+   *                unexpected death in real time instead of only
+   *                discovering it reactively on the next getOrCreate() for
+   *                the same key (or never, if no such call ever comes).
    */
   spawnLauncher(
     launcherExpPath: string,
-    env: Record<string, string>
+    env: Record<string, string>,
+    onExit?: (code: number | null) => void
   ): number;
 
   /**
@@ -159,7 +184,8 @@ export interface PoolDeps {
 
 function defaultSpawnLauncher(
   launcherExpPath: string,
-  env: Record<string, string>
+  env: Record<string, string>,
+  onExit?: (code: number | null) => void
 ): number {
   const child = Bun.spawn(["expect", "-f", launcherExpPath], {
     stdout: "pipe",
@@ -171,6 +197,12 @@ function defaultSpawnLauncher(
   // Drain output asynchronously to prevent pipe backpressure.
   void drainToStderr(child.stdout, "expect/claude stdout");
   void drainToStderr(child.stderr, "expect/claude stderr");
+
+  // Gap (c): learn about the child's death in real time, whatever the
+  // cause — Bun.spawn alone never notifies the pool of this.
+  if (onExit) {
+    void child.exited.then((code) => onExit(code));
+  }
 
   return child.pid;
 }
@@ -352,7 +384,10 @@ export class ChannelsSessionPool {
   async getOrCreate(sessionKey: string): Promise<SessionState> {
     const existing = this.sessions.get(sessionKey);
     if (existing) {
-      const socketPresent = isSocket(existing.socketPath);
+      // Gap (d): a socket-type FILE is not proof of a live LISTENER — a
+      // process killed without graceful close() (SIGKILL, crash) leaves the
+      // file behind. A real connect probe catches that; a plain stat does not.
+      const socketPresent = await isSocketLive(existing.socketPath);
       const procPresent =
         existing.expectPid !== undefined
           ? this.isPidAlive(existing.expectPid)
@@ -413,15 +448,24 @@ export class ChannelsSessionPool {
     const noAccountConnectors =
       Boolean(process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"]) &&
       process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] !== "0";
-    const expectPid = this.deps.spawnLauncher(this.launcherExpPath, {
-      HERMES_CHANNEL_SOCKET: socketPath,
-      HERMES_SESSION_NAME: sessionName,
-      // Persona/sandbox cwd: explicit env wins so the launcher cd's to the
-      // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
-      // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
-      HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
-      ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
-    });
+    const expectPid = this.deps.spawnLauncher(
+      this.launcherExpPath,
+      {
+        HERMES_CHANNEL_SOCKET: socketPath,
+        HERMES_SESSION_NAME: sessionName,
+        // Persona/sandbox cwd: explicit env wins so the launcher cd's to the
+        // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
+        // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
+        HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
+        ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
+      },
+      // Gap (c): react the moment this exact child dies, whatever the
+      // cause. expectPid/generation are captured by closure — by the
+      // time this fires (always asynchronously), both `const`s above
+      // have already been assigned, since a real process only exits
+      // after this synchronous call returns.
+      (code) => this.handleUnexpectedExit(sessionKey, generation, expectPid, code)
+    );
 
     process.stderr.write(
       `session-pool: spawned expect pid=${expectPid} key=${sessionKey} ` +
@@ -447,6 +491,52 @@ export class ChannelsSessionPool {
   }
 
   // --------------------------------------------------------------------------
+  // handleUnexpectedExit — gap (c): reactive cleanup the instant a spawned
+  // child dies for ANY reason, without waiting for a future getOrCreate().
+  // --------------------------------------------------------------------------
+
+  /**
+   * Invoked via the spawnLauncher onExit callback when a session's expect
+   * process exits, whatever the cause (crash, external SIGKILL, normal
+   * expect completion). Removes the Map entry and cleans up its socket
+   * file immediately — this is what makes an abrupt supervisor-side crash
+   * of the CHILD (as opposed to the whole pool process) self-heal without
+   * waiting for the idle-eviction scan or another request for the same key.
+   *
+   * Guarded by GENERATION identity (discretionary item A — ABA hardening),
+   * not PID. A PID-only guard is vulnerable to OS PID reuse: if this exact
+   * key is evicted and respawned before this callback fires, and the new
+   * spawn happens to be assigned the SAME PID by the OS (recycled — bun's
+   * synthetic PIDs in tests can coincide too), `state.expectPid !==
+   * expectPid` would wrongly be false and this would tear down the NEWER,
+   * legitimate session. `generation` is a fresh randomUUID per spawn — it
+   * can never collide with a prior spawn's, so it is the correct identity
+   * to compare, not the OS-recycled PID number. expectPid is passed along
+   * only for the log line (still useful to know which PID exited).
+   */
+  private handleUnexpectedExit(
+    sessionKey: string,
+    generation: string,
+    expectPid: number,
+    code: number | null
+  ): void {
+    const state = this.sessions.get(sessionKey);
+    if (!state || state.generation !== generation) return;
+
+    this.sessions.delete(sessionKey);
+    process.stderr.write(
+      `session-pool: pid=${expectPid} gen=${generation} for key=${sessionKey} exited unexpectedly ` +
+        `(code=${code}) — removed from pool without waiting for next request\n`
+    );
+
+    try { state.client.close(); } catch { /* ignore */ }
+
+    if (existsSync(state.socketPath)) {
+      unlink(state.socketPath).catch(() => { /* ignore — already gone */ });
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // release — update lastActivityAt after a completed turn
   // --------------------------------------------------------------------------
 
@@ -467,11 +557,29 @@ export class ChannelsSessionPool {
    * @param graceful  If true, wait up to DRAIN_TIMEOUT_MS for pendingCount===0
    *                  before killing. Use false for stale/forced evictions.
    *
-   * Kill order (scoped, never generic):
+   * Kill order (scoped, never generic), escalating ONLY as far as needed:
    *   1. SIGTERM to exact expect PID.
-   *   2. lsof -t <socket> → SIGTERM each holder.
-   *   3. Last resort: pkill -f "<sessionName>" (hash-scoped, NOT generic).
+   *   2. lsof -t <socket> → SIGTERM each holder (the plugin's bun listener).
+   *   3. Verify the exact PID actually died (gap a). If it survived SIGTERM,
+   *      escalate to SIGKILL and verify again.
+   *   4. Last resort: pkill -f "<sessionName>" (hash-scoped, NOT generic) —
+   *      ONLY if the PID is still detectable after the SIGKILL escalation.
    *   NEVER pkill -f "claude_hermes" without the hash suffix.
+   *
+   * Review item 3 — `claude` is never signaled directly, only `expect`
+   * (step 1) and the socket holder (step 2). This is intentional, verified
+   * empirically (`scratch/ja25-cascade-probe.ts` against a real spawned
+   * session, not assumed): `expect` allocates the pty `claude` runs
+   * attached to, so when `expect` dies the kernel sends SIGHUP to that
+   * pty's foreground process group — `claude` dies too, via that cascade,
+   * WITHOUT evict() ever targeting it directly. Measured: expect died at
+   * +53ms, claude followed via the cascade at +2594ms. So by the time
+   * evict() returns, `expect` is confirmed dead but `claude` may still be
+   * mid-teardown for a couple more seconds in the background — this is
+   * fine because the thing that actually matters for socket-path reuse
+   * (freeing the socket so a respawn doesn't collide) is handled
+   * immediately and directly by step 2 (killSocketHolders), which does not
+   * wait on that cascade at all.
    */
   async evict(sessionKey: string, graceful: boolean): Promise<void> {
     const state = this.sessions.get(sessionKey);
@@ -492,12 +600,32 @@ export class ChannelsSessionPool {
     this.deps.killSocketHolders(state.socketPath);
 
     // Brief wait for graceful termination.
-    await new Promise<void>((r) => setTimeout(r, 500));
+    await new Promise<void>((r) => setTimeout(r, EVICT_SIGTERM_GRACE_MS));
 
-    // 3. Last resort: pkill by scoped session name.
-    // sessionName is always "claude_hermes_<hash8>" — never the bare generic.
-    // Injected via deps so tests can assert the exact name pattern.
-    this.deps.killByName(state.sessionName);
+    // 3. Gap (a): verify the exact PID actually died — never assume a
+    // fire-and-forget signal worked. Escalate SIGTERM -> SIGKILL, and only
+    // fall back to the name-scoped last resort if the PID survives BOTH.
+    let stillAlive =
+      state.expectPid !== undefined && this.deps.isPidAlive(state.expectPid);
+
+    if (stillAlive && state.expectPid !== undefined) {
+      process.stderr.write(
+        `session-pool: pid=${state.expectPid} survived SIGTERM for key=${sessionKey} — escalating to SIGKILL\n`
+      );
+      this.deps.killPid(state.expectPid, "SIGKILL");
+      await new Promise<void>((r) => setTimeout(r, EVICT_SIGKILL_GRACE_MS));
+      stillAlive = this.deps.isPidAlive(state.expectPid);
+    }
+
+    if (stillAlive) {
+      process.stderr.write(
+        `session-pool: pid=${state.expectPid} survived SIGKILL for key=${sessionKey} — falling back to killByName\n`
+      );
+      // Last resort: pkill by scoped session name.
+      // sessionName is always "claude_hermes_<hash8>" — never the bare generic.
+      // Injected via deps so tests can assert the exact name pattern.
+      this.deps.killByName(state.sessionName);
+    }
 
     // Close the client.
     try { state.client.close(); } catch { /* ignore */ }

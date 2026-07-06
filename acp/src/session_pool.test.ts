@@ -291,6 +291,83 @@ describe("generation token on respawn", () => {
 });
 
 // ---------------------------------------------------------------------------
+// getOrCreate reuse decision must use a LIVE-listener check (gap d)
+//
+// isSocket() (file-type check) says "present" even for a dangling socket
+// file left behind by a process killed without graceful close(). Reusing
+// such a session hands the caller a dead connection. getOrCreate() must
+// detect this and respawn instead of reusing.
+// ---------------------------------------------------------------------------
+
+describe("getOrCreate reuse decision uses a live-listener check (gap d)", () => {
+  it("does NOT reuse a session whose socket file is dangling (listener died without cleanup)", async () => {
+    const fakeServers = new Map<string, Server>();
+    let spawnCount = 0;
+    let listenerProc: ReturnType<typeof Bun.spawn> | undefined;
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnCount++;
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        if (spawnCount === 1) {
+          // First spawn: a REAL subprocess holds the socket so the test can
+          // kill JUST the listener (SIGKILL, no cleanup) independently of
+          // the pool's own kill path.
+          listenerProc = Bun.spawn(
+            [
+              "bun",
+              "-e",
+              `require("net").createServer(()=>{}).listen(${JSON.stringify(socketPath)})`,
+            ],
+            { stdout: "ignore", stderr: "ignore", stdin: "ignore" }
+          );
+        } else {
+          void startFakeSocket(socketPath).then((srv) =>
+            fakeServers.set(socketPath, srv)
+          );
+        }
+        return 90000 + spawnCount;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; }, // the expect wrapper PID stays "alive" throughout
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const key = "dangling-socket-key";
+
+    const s1 = await pool.getOrCreate(key);
+
+    // Wait for the real listener subprocess to actually bind before killing it.
+    const deadline = Date.now() + 5000;
+    while (!existsSync(s1.socketPath)) {
+      if (Date.now() > deadline) throw new Error("listener socket never appeared");
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    // Kill it WITHOUT graceful close — the socket file survives on disk
+    // (dangling), exactly the JA-25 shape.
+    listenerProc!.kill("SIGKILL");
+    await listenerProc!.exited;
+    expect(existsSync(s1.socketPath)).toBe(true); // file still there, no listener
+
+    // Second call for the SAME key: the old isSocket()-only check would
+    // wrongly report "reuse" (file present + isPidAlive says proc alive).
+    const s2 = await pool.getOrCreate(key);
+
+    expect(s2.generation).not.toBe(s1.generation); // respawned, not reused
+    expect(spawnCount).toBe(2);
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ACP session mapping
 // ---------------------------------------------------------------------------
 
@@ -550,6 +627,268 @@ describe("scoped kill assertion", () => {
   // Satisfy TypeScript — afterEach reference
   let fake: FakeDeps;
   afterEach(async () => { await fake?.cleanup(); });
+});
+
+// ---------------------------------------------------------------------------
+// Real-time child-exit detection (gap c)
+//
+// Previously Bun.spawn's return value (just a PID) was used with no
+// onExit/child.exited wiring at all — the pool only ever discovered a dead
+// child reactively, on the NEXT getOrCreate() call for that key (or never,
+// if no further request for that key ever arrives). spawnLauncher now takes
+// an optional onExit callback; the pool must react immediately: remove the
+// Map entry and clean up the socket file, without waiting for another
+// getOrCreate() call.
+// ---------------------------------------------------------------------------
+
+describe("real-time child-exit detection (gap c)", () => {
+  it("removes the session from the pool as soon as the child exits unexpectedly, with no further call", async () => {
+    const fakeServers = new Map<string, Server>();
+    let capturedOnExit: ((code: number | null) => void) | undefined;
+    const EXPECTED_PID = 62001;
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env, onExit) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        capturedOnExit = onExit;
+        return EXPECTED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const state = await pool.getOrCreate("real-time-exit-key");
+    expect(pool.size).toBe(1);
+    expect(capturedOnExit).toBeDefined();
+
+    // Simulate the child dying unexpectedly (crash / OOM-kill / SIGKILL from
+    // outside) — nobody called evict(), nobody called getOrCreate() again.
+    capturedOnExit!(1);
+    // The callback may itself be async internally; give it a tick.
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(pool.size).toBe(0); // reacted immediately, no further call needed
+    expect(existsSync(state.socketPath)).toBe(false); // socket file cleaned up
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("guards by generation, not PID — a reused PID from an older spawn must not clobber a newer session (discretionary item A, ABA hardening)", async () => {
+    const fakeServers = new Map<string, Server>();
+    const capturedOnExits: Array<(code: number | null) => void> = [];
+    const REUSED_PID = 65001; // returned for EVERY spawn — simulates OS PID reuse across respawns
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env, onExit) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        if (onExit) capturedOnExits.push(onExit);
+        return REUSED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const key = "aba-key";
+
+    const s1 = await pool.getOrCreate(key);
+    await pool.evict(key, false); // legitimate respawn path
+    const s2 = await pool.getOrCreate(key);
+
+    // Confirms the ABA setup: same PID, but a genuinely different session.
+    expect(s1.expectPid).toBe(s2.expectPid);
+    expect(s2.generation).not.toBe(s1.generation);
+
+    // The FIRST spawn's onExit fires late. A PID-only guard would see
+    // "expectPid matches the current Map entry" (true — same reused PID!)
+    // and wrongly tear down s2. Must be a no-op: identity is the
+    // generation nonce, not the OS-recycled PID number.
+    capturedOnExits[0]!(1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(pool.size).toBe(1); // s2 untouched
+    expect(existsSync(s2.socketPath)).toBe(true);
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("does NOT clobber a NEWER respawned session under the same key (stale exit from an old spawn)", async () => {
+    const fakeServers = new Map<string, Server>();
+    const capturedOnExits: Array<(code: number | null) => void> = [];
+    let spawnCount = 0;
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env, onExit) {
+        spawnCount++;
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        if (onExit) capturedOnExits.push(onExit);
+        return 63000 + spawnCount;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const key = "respawn-race-key";
+
+    const s1 = await pool.getOrCreate(key);
+    await pool.evict(key, false); // legitimate respawn path
+    const s2 = await pool.getOrCreate(key);
+    expect(s2.generation).not.toBe(s1.generation);
+    expect(pool.size).toBe(1);
+
+    // The FIRST spawn's onExit fires late (e.g. delayed process-table
+    // cleanup) — it must be a no-op now, since the Map holds s2, not s1.
+    capturedOnExits[0]!(1);
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(pool.size).toBe(1); // s2 untouched
+    expect(existsSync(s2.socketPath)).toBe(true); // s2's socket untouched
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// evict() escalation (gap a)
+//
+// Previously evict() fired SIGTERM + killSocketHolders, waited a fixed
+// 500ms, then ALWAYS called killByName regardless of whether the process
+// actually died. It never checked isPidAlive after signaling. Now it must:
+//   - skip killByName when the PID is confirmed dead after SIGTERM
+//   - escalate to SIGKILL when the PID survives SIGTERM
+//   - fall back to killByName only if the PID survives even SIGKILL
+// ---------------------------------------------------------------------------
+
+describe("evict() escalation (gap a)", () => {
+  it("does NOT call killByName when the process died cleanly after SIGTERM", async () => {
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+    const killByNameCalls: string[] = [];
+    const fakeServers = new Map<string, Server>();
+    const EXPECTED_PID = 61001;
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return EXPECTED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; }, // confirmed dead right after SIGTERM
+      killByName(name) { killByNameCalls.push(name); },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("clean-death-key");
+    await pool.evict("clean-death-key", false);
+
+    expect(killPidCalls).toEqual([{ pid: EXPECTED_PID, signal: "SIGTERM" }]); // no SIGKILL needed
+    expect(killByNameCalls.length).toBe(0); // process confirmed dead — no last resort needed
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("escalates to SIGKILL when the process survives SIGTERM, then stops (confirmed dead)", async () => {
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+    const killByNameCalls: string[] = [];
+    const fakeServers = new Map<string, Server>();
+    const EXPECTED_PID = 61002;
+
+    let sigtermSent = false;
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return EXPECTED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) {
+        killPidCalls.push({ pid, signal });
+        if (signal === "SIGTERM") sigtermSent = true;
+      },
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      // Survives SIGTERM (still alive right after it), confirmed dead once SIGKILL has been sent.
+      isPidAlive(_pid) { return sigtermSent && !killPidCalls.some((c) => c.signal === "SIGKILL"); },
+      killByName(name) { killByNameCalls.push(name); },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("survives-sigterm-key");
+    await pool.evict("survives-sigterm-key", false);
+
+    expect(killPidCalls).toEqual([
+      { pid: EXPECTED_PID, signal: "SIGTERM" },
+      { pid: EXPECTED_PID, signal: "SIGKILL" },
+    ]);
+    expect(killByNameCalls.length).toBe(0); // SIGKILL confirmed it dead — no last resort needed
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("falls back to killByName only when the process survives even SIGKILL", async () => {
+    const killPidCalls: Array<{ pid: number; signal: string }> = [];
+    const killByNameCalls: string[] = [];
+    const fakeServers = new Map<string, Server>();
+    const EXPECTED_PID = 61003;
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return EXPECTED_PID;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(pid, signal) { killPidCalls.push({ pid, signal }); },
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; }, // never dies — worst case (e.g. zombie/defunct)
+      killByName(name) { killByNameCalls.push(name); },
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    const state = await pool.getOrCreate("never-dies-key");
+    await pool.evict("never-dies-key", false);
+
+    expect(killPidCalls).toEqual([
+      { pid: EXPECTED_PID, signal: "SIGTERM" },
+      { pid: EXPECTED_PID, signal: "SIGKILL" },
+    ]);
+    expect(killByNameCalls).toEqual([state.sessionName]); // last resort, scoped name only
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
