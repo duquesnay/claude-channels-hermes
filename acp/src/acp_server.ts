@@ -232,11 +232,29 @@ class ClaudeAgent implements Agent {
   }
 
   // --------------------------------------------------------------------------
-  // cancel — drop the ACP mapping (pool slot is retained for other sessions)
+  // cancel — stop the CURRENT turn; the session itself stays open (JA-38 b)
   // --------------------------------------------------------------------------
 
-  async cancel(params: CancelNotification): Promise<void> {
-    this.pool.unregisterAcpSession(params.sessionId);
+  /**
+   * JA-38 (b): session/cancel must NOT tear down the ACP-session -> session_key
+   * mapping. Per the ACP SDK docs, closeSession "must cancel any ongoing work
+   * (as if session/cancel was called) AND THEN free up any resources" — i.e.
+   * cancel is a SUBSET of closeSession's behavior (stop current work), not a
+   * superset. This previously called pool.unregisterAcpSession() (copied from
+   * closeSession's body since the very first commit, before the pool-based
+   * session_key routing existed) — that removed the mapping prompt() depends
+   * on, so the NEXT prompt on the same still-open session threw "ACP session
+   * ... not found" (observed at the JSON-RPC layer as -32603 Internal Error
+   * with empty output), even though the client never closed the session.
+   *
+   * This is currently a no-op: there is no mechanism yet to interrupt the
+   * underlying claude subprocess mid-turn (see JA-38 (a) — investigated
+   * separately; a running turn keeps going and completes normally, matching
+   * JA-29's already-accepted "agent ignores cancel and completes" fallback).
+   * If (a) becomes feasible, this is where the interrupt signal would be sent.
+   */
+  async cancel(_params: CancelNotification): Promise<void> {
+    // Intentionally does not touch pool state — see docstring above.
   }
 
   // --------------------------------------------------------------------------

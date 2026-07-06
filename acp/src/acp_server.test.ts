@@ -12,9 +12,11 @@
 
 import { describe, it, expect, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { createServer, type Server } from "node:net";
+import { unlinkSync, existsSync } from "node:fs";
 import { createAgent } from "./acp_server.ts";
 import { ChannelsSessionPool, PoolFullError } from "./session_pool.ts";
-import type { SessionState } from "./session_pool.ts";
+import type { SessionState, PoolDeps } from "./session_pool.ts";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,70 @@ function makeMockPool(opts: {
   } as unknown as ChannelsSessionPool;
 
   return pool;
+}
+
+// ---------------------------------------------------------------------------
+// Real-pool helpers (JA-38 bug b) — makeMockPool()'s sessionKeyForAcp is an
+// independent stub with no real state, so it CANNOT reproduce a bug that
+// depends on the interaction between unregisterAcpSession and
+// sessionKeyForAcp (both read/write the pool's own acpToKey Map). These
+// helpers wire a REAL ChannelsSessionPool with fake spawn/kill deps (no real
+// claude process, no real socket-holding subprocess) so that interaction is
+// exercised for real.
+// ---------------------------------------------------------------------------
+
+function startFakeSocket(socketPath: string): Promise<Server> {
+  return new Promise((resolve, reject) => {
+    const server = createServer(() => {});
+    server.on("error", reject);
+    server.listen(socketPath, () => resolve(server));
+  });
+}
+
+function stopFakeSocket(server: Server, socketPath: string): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => {
+      if (existsSync(socketPath)) {
+        try { unlinkSync(socketPath); } catch { /* ignore */ }
+      }
+      resolve();
+    });
+  });
+}
+
+function makeRealPool(): { pool: ChannelsSessionPool; cleanup: () => Promise<void> } {
+  const fakeServers = new Map<string, Server>();
+
+  const deps: Partial<PoolDeps> = {
+    spawnLauncher(_launcherExpPath, env) {
+      const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+      void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+      return 91000 + fakeServers.size;
+    },
+    createClient(_socketPath) {
+      return {
+        sendPrompt: async (_c: string, _t: number, _onChunk?: (d: string) => void) => "ok",
+        close: () => {},
+        get pendingCount() { return 0; },
+      };
+    },
+    killPid(_pid, _signal) {},
+    killSocketHolders(_socketPath) {},
+    now: () => Date.now(),
+    isPidAlive: (_pid) => true,
+    killByName(_name) {},
+  };
+
+  const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+
+  return {
+    pool,
+    cleanup: async () => {
+      for (const [socketPath, server] of fakeServers) {
+        await stopFakeSocket(server, socketPath);
+      }
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +526,54 @@ describe("createAgent", () => {
 
     const unregisterMock = pool.unregisterAcpSession as ReturnType<typeof mock>;
     expect(unregisterMock.mock.calls.some((c) => c[0] === sessionId)).toBe(true);
+  });
+
+  // --------------------------------------------------------------------------
+  // JA-38 (b): a session/cancel notification must NOT break the NEXT prompt
+  // on the SAME (still-open) ACP session.
+  //
+  // Per the ACP SDK docs, closeSession "must cancel any ongoing work (as if
+  // session/cancel was called) AND THEN free up any resources" — i.e. cancel
+  // is a SUBSET of closeSession's behavior (stop current work), not a
+  // superset. The current cancel() calls pool.unregisterAcpSession(), which
+  // is the resource-freeing step that belongs to closeSession — it tears
+  // down the ACP-session-id -> session_key mapping that routing depends on.
+  // A real client (e.g. Janet) sends session/cancel to interrupt one turn
+  // and then keeps sending prompts on the SAME sessionId — exactly the
+  // reported symptom: the turn AFTER a cancel gets a hard error (observed as
+  // "-32603 Internal Error" + empty output at the JSON-RPC layer), even
+  // though the session was never closed.
+  //
+  // Uses a REAL ChannelsSessionPool (not makeMockPool()) because the bug is
+  // in the interaction between unregisterAcpSession and sessionKeyForAcp —
+  // makeMockPool()'s sessionKeyForAcp is an independent stub that always
+  // returns a fixed string regardless of what unregisterAcpSession was
+  // called with, so it cannot reproduce this.
+  // --------------------------------------------------------------------------
+
+  it("prompt on the same session succeeds after a cancel notification (JA-38 bug b)", async () => {
+    const { conn } = makeMockConnection();
+    const { pool, cleanup } = makeRealPool();
+    const agent = createAgent(conn, pool);
+
+    const { sessionId } = await agent.newSession({
+      _meta: { "hermes.channels/session_key": "ja38-cancel-key" },
+    } as any);
+
+    // Simulate: a turn starts, the client sends session/cancel while (or
+    // shortly after) it's in flight — the agent underneath may ignore it
+    // and finish normally (JA-29's documented fallback), but the session
+    // itself must remain valid for the NEXT prompt.
+    await agent.cancel({ sessionId } as any);
+
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "next turn after cancel" }],
+    } as any);
+
+    expect(result.stopReason).toBe("end_turn");
+
+    await cleanup();
   });
 
   // --------------------------------------------------------------------------
