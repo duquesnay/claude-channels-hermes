@@ -231,6 +231,72 @@ export async function handleReplyClose(args: Record<string, unknown>) {
   throw new Error(`reply_close: must pass either 'chat_id' (common case) or 'handle' (after reply_open)`)
 }
 
+// ============================================================================
+// fallback_close — JA-24 v2 stage 4: Stop-hook last-resort delivery
+// ============================================================================
+// A Stop hook (a SEPARATE process, spawned by the CLI when the model's turn
+// ends, outside the model's own tool-calling loop) is the last line of
+// defense against the exact prod failure mode: the model produces real,
+// correct text but calls neither reply_open nor reply_close. Where the
+// anti-wedge guard only fails the turn cleanly, the Stop hook can extract the
+// model's actual answer from the transcript and deliver it here.
+//
+// This is NOT an MCP tool — the model never calls it, and never should. It
+// arrives over the same raw IPC socket as `prompt`/result messages, from the
+// hook process's own throwaway connection (distinct from Hermes's long-lived
+// one). The PLUGIN arbitrates, not the hook: pendingByRequestId (simple path)
+// and streams (advanced reply_open path, keyed by handle but carrying the
+// same request_id) are the single source of truth for "already closed?" —
+// reusing the exact invariant enforcement reply_close's double-close guard
+// and the anti-wedge guard both already rely on. A fallback_close can never
+// produce a second result for a request_id a tool call (or the guard)
+// already closed.
+export function handleFallbackClose(msg: { request_id: string; content?: string }, conn: Socket): void {
+  const { request_id, content } = msg
+  const ack = (delivered: boolean, error?: string) => {
+    conn.write(JSON.stringify({ type: 'fallback_close_ack', request_id, delivered, ...(error ? { error } : {}) }) + '\n')
+  }
+
+  const pending = pendingByRequestId.get(request_id)
+  if (pending) {
+    // Mirrors the JA-24 v2 chat_id-close rule: never silently deliver an
+    // empty answer (the JA-25 bug class) — reject and leave the entry armed
+    // so a tool call or a corrected fallback retry can still succeed.
+    if (!content) {
+      ack(false, 'content is required for fallback_close')
+      return
+    }
+    clearTimeout(pending.guardTimer)
+    pendingByRequestId.delete(request_id)
+    ja24Log(`hermes-channel: fallback_close (simple path) request_id=${request_id} ts=${Date.now()}\n`)
+    finalizeReply(request_id, pending.conn, pending.startedAt, content)
+    ack(true)
+    return
+  }
+
+  // Advanced path: reply_open was called (entry moved to `streams`, keyed by
+  // handle) but reply_close never followed. streams isn't keyed by
+  // request_id, so scan for the matching entry — the pool is capped at a
+  // handful of concurrent turns, so this is cheap.
+  for (const [handle, s] of streams) {
+    if (s.request_id !== request_id) continue
+    const finalText = content || s.accumulatedText
+    if (!finalText) {
+      ack(false, 'content is required for fallback_close (no prior reply_chunk to fall back on)')
+      return
+    }
+    streams.delete(handle)
+    ja24Log(`hermes-channel: fallback_close (advanced path) request_id=${request_id} handle=${handle} ts=${Date.now()}\n`)
+    finalizeReply(s.request_id, s.hermes_conn, s.startedAt, finalText)
+    ack(true)
+    return
+  }
+
+  // Neither map has it: already delivered by a real tool call, or the
+  // anti-wedge guard already fired. Clean no-op — the hook logs and exits.
+  ack(false, 'no pending request for this request_id — already closed')
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
   const args = req.params.arguments as Record<string, unknown>
 
@@ -311,6 +377,13 @@ function handleIpcLine(line: string, conn: Socket): void {
     msg = JSON.parse(line)
   } catch (err) {
     process.stderr.write(`hermes-channel: IPC JSON parse error: ${err} — line=${line.slice(0, 200)}\n`)
+    return
+  }
+
+  if (msg.type === 'fallback_close') {
+    // From a Stop hook's own throwaway connection, not Hermes's long-lived
+    // one — see handleFallbackClose's own doc comment for the full contract.
+    handleFallbackClose(msg as unknown as { request_id: string; content?: string }, conn)
     return
   }
 
