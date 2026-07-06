@@ -253,6 +253,12 @@ export async function handleReplyClose(args: Record<string, unknown>) {
 // already closed.
 export function handleFallbackClose(msg: { request_id: string; content?: string }, conn: Socket): void {
   const { request_id, content } = msg
+  // Logged unconditionally, before knowing the outcome — proves the hook's
+  // message reached the plugin at all, distinct from whether the plugin
+  // then delivered it or correctly no-op'd. Without this, a live check like
+  // "did fallback_close arrive?" can't tell "the hook never ran" apart from
+  // "the hook ran and this was a harmless no-op" (JA-24 v2 spike finding).
+  ja24Log(`hermes-channel: fallback_close received request_id=${request_id} has_content=${Boolean(content)} ts=${Date.now()}\n`)
   const ack = (delivered: boolean, error?: string) => {
     conn.write(JSON.stringify({ type: 'fallback_close_ack', request_id, delivered, ...(error ? { error } : {}) }) + '\n')
   }
