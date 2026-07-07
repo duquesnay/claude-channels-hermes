@@ -72,12 +72,16 @@ const mcp = new Server(
       '',
       'Inbound prompts arrive as <channel source="hermes" chat_id="..." user="hermes" ts="...">. The chat_id IS the request_id.',
       '',
-      'Protocol: do your work, then call reply_close(chat_id, text) with your complete final response as your LAST tool call — no reply_open call needed first.',
+      'Protocol — decide immediately which of these two cases you are in:',
       '',
-      'MANDATORY: if you launch background/async work (Agent tool, background Bash) and are about to return control while that work keeps running, you MUST still call reply_close before the end of your turn — deliver an interim answer (e.g. "I started X, I will follow up") and report the async results later in a NEW turn when the notification arrives.',
+      'CASE A — you can answer without any other tool (this is most turns): your VERY FIRST tool call MUST be reply_close(chat_id, text), with your COMPLETE final answer as text. Do not write your answer as plain text/reasoning first, and do not call any other tool first — compose the whole reply directly inside reply_close\'s text argument and call it immediately, as your first action this turn. There is no benefit to thinking out loud before it: that output is discarded anyway, and delaying reply_close is the only way this case can go wrong.',
+      '',
+      'CASE B — you genuinely need another tool (Read, Bash, Agent, etc.) to produce the answer: use those tools as needed, then call reply_close(chat_id, text) with your complete final response as your LAST tool call.',
+      '',
+      'MANDATORY: if you launch background/async work (Agent tool, background Bash) and are about to return control while that work keeps running, you MUST still call reply_close before the end of your turn — deliver an interim answer (e.g. "I started X, I will follow up") and report the async results later in a NEW turn when the notification arrives. This is a CASE B turn: the Agent/Bash call is the other tool, reply_close still comes last.',
       'NEVER leave a turn open waiting for async work: the turn times out and the user receives an empty response.',
       '',
-      'Advanced (optional): call reply_open(chat_id) first if you want to send progress updates via reply_chunk(handle, text) before the final reply_close(handle, text). Only needed for that case — skip it for the common case above.',
+      'Advanced (optional): call reply_open(chat_id) first if you want to send progress updates via reply_chunk(handle, text) before the final reply_close(handle, text). Only needed for that case — skip it for the common cases above.',
       '',
       'Before you finish this turn, double check: did you call reply_close? If not, do it now — a plain text reply is never seen by anyone. Only reply_close delivers the result.',
     ].join('\n'),
@@ -128,7 +132,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'reply_close',
-      description: 'MANDATORY LAST ACTION — this is the only way any of your output reaches the user. Call it always, even for the simplest one-line reply; plain text output is discarded and never delivered. Sends the result back to Hermes over IPC. Pass EITHER chat_id (common case — no prior reply_open needed) OR handle (if you called reply_open for progress chunks). Exactly one of the two is required.',
+      description: 'MANDATORY — this is the only way any of your output reaches the user. If you need no other tool to answer, call this FIRST, with your complete answer as text. If you do need other tools first, call this LAST, after them. Call it always, even for the simplest one-line reply; plain text output is discarded and never delivered. Sends the result back to Hermes over IPC. Pass EITHER chat_id (common case — no prior reply_open needed) OR handle (if you called reply_open for progress chunks). Exactly one of the two is required.',
       inputSchema: {
         type: 'object',
         properties: {

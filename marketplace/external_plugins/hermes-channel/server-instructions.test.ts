@@ -105,6 +105,38 @@ describe('hermes-channel MCP instructions', () => {
     expect(instructions.toLowerCase()).toMatch(/directly|immediately/)
     expect(instructions).toMatch(/reply_close/)
   })
+
+  // JA-24 v3: the ~10% residual skip under a heavy persona (JA-24 v2, see
+  // project memory project_ja24v2_robust_collapse_mission) is a weak model
+  // forgetting the reply_close call by the END of a turn — exactly the
+  // failure mode the OLD protocol never had, because its anchor
+  // (reply_open MUST be your very first tool call) was checked at the START,
+  // when nothing has yet distracted the model. v3 restores a start-of-turn
+  // anchor for the dominant case (a turn answerable with no other tool) while
+  // keeping the end-of-turn anchor for the minority case that genuinely needs
+  // tools first — collapsing both into a single call is not possible (you
+  // cannot close before you've read the file you were asked to summarize).
+  test('mandates reply_close as the very FIRST tool call when no other tool is needed to answer', () => {
+    const instructions = extractInstructions()
+
+    expect(instructions.toLowerCase()).toMatch(/first tool call/)
+    expect(instructions).toMatch(/reply_close\(chat_id, text\)/)
+    expect(instructions.toLowerCase()).toMatch(/without (any )?other tool/)
+    // Composing the full answer as the FIRST action is a different cognitive
+    // demand than the old empty-handed reply_open anchor (which needed only
+    // chat_id, not a composed answer) — guard against the model narrating its
+    // answer in discarded plain text before finally getting to the tool call.
+    expect(instructions.toLowerCase()).toMatch(/do not (write|output|produce).*(plain text|reasoning|narrat)/)
+    expect(instructions.toLowerCase()).toMatch(/do not call (any )?other tool(s)? first/)
+  })
+
+  test('mandates using other tools first, then reply_close LAST, when a tool is genuinely needed', () => {
+    const instructions = extractInstructions()
+
+    expect(instructions.toLowerCase()).toMatch(/last tool call/)
+    expect(instructions.toLowerCase()).toMatch(/need(s)? (another|other) tool/)
+    expect(instructions).toMatch(/reply_close/)
+  })
 })
 
 describe('hermes-channel MCP tool descriptions', () => {
