@@ -49,8 +49,10 @@ plugin block above; persona is SOUL.md; everything else is env + a settings file
 
 ### B. Supervisor env vars (the isolation layer)
 
-Set by the instance's startup wrapper (prod Janet: `~/.local/bin/janet-startup.sh`)
-or directly in the launchd plist `EnvironmentVariables`.
+Set by the instance's startup wrapper (standard: `scripts/instance-startup.sh`
+in the Python repo — see "Distribution & releases"; prod Janet still runs its
+precursor `~/.local/bin/janet-startup.sh`) or directly in the launchd plist
+`EnvironmentVariables`.
 
 | Var | Role | If unset |
 |-----|------|----------|
@@ -60,6 +62,7 @@ or directly in the launchd plist `EnvironmentVariables`.
 | `HERMES_CLAUDE_ALLOWED_TOOLS` | `--allowedTools` (space-separated string) | launcher default `mcp__…hermes-channel__* Read` |
 | `HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS` | when truthy → injects `ENABLE_CLAUDEAI_MCP_SERVERS=0` (kills claude.ai Gmail/Drive/Notes/Slack connectors) | unset = connectors ON (prod default) |
 | `HERMES_CHANNELS_TURN_TIMEOUT_MS` | supervisor per-turn timeout (positive integer ms; invalid → default) | `120000` — see "Timeout stack" below |
+| `HERMES_REPLY_CLOSE_GUARD_MS` | plugin anti-wedge guard delay (inherited by the spawned session; read by the `hermes-channel` plugin, not the supervisor) | `90000` — see "Timeout stack" below |
 
 **Critical coupling:** `HERMES_CLAUDE_SETTINGS_FILE` and `HERMES_SESSION_CWD` must be
 set *together*. `--setting-sources project,local` (added only in the launcher's
@@ -88,6 +91,90 @@ Persona (SOUL.md) + operational instructions (AGENTS.md) + heartbeat/proactive
 source of truth for identity** — never duplicate the persona into a launcher's
 `--append-system-prompt`.
 
+## Per-instance access matrix
+
+Three instances, one engine, DELIBERATELY different access. Values below are
+decisions, not drift.
+
+| Instance | Account (context) | Plugins / MCP | claude.ai connectors | Skills | Persona |
+|----------|-------------------|---------------|----------------------|--------|---------|
+| **Janet prod** | `guillaume` (perso) | gws, apple-mail, slack-admin, miro, gemma4, op-service-account, vault-server (+ hermes, hermes-channel) | **OPEN** — deliberate decision 2026-07-06 (`ENABLE_CLAUDEAI_MCP_SERVERS=1`, `NO_ACCOUNT_CONNECTORS` unset) | inherited from HOME (`~/.claude/skills`) | Good Janet — `~/.hermes/SOUL.md` |
+| **Bad Janet** | `gduquesnay` (Mantu) | hermes, notes-local (vault `mantu`), m365-mcp (tenant Mantu — wiring pending, see gap note below) | open by **status quo**; conscious decision PENDING — `HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS` is the ready-made switch | gduquesnay HOME (own account, never guillaume's) | Bad Janet twin — own `SOUL.md`, never cloned from prod |
+| **janet-test** | `guillaume` (test) | lean: hermes + hermes-channel only | **CUT** (`HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS=1` in `start.sh`) | none (lean) | default seeded SOUL.md |
+
+**Rule — homogenize the MECHANISM, never the toolsets.** All instances share
+the same config surface (same KEYS: the `config.yaml` blocks of section A, the
+env vars of section B, `claude-settings.json`, the sandbox layout) with
+per-instance VALUES. Cross-instance divergence in values (plugins, connectors,
+skills) is a per-instance product decision — never "align Bad Janet's tools on
+prod's". A gap is a bug only when an instance is missing a KEY (e.g. no
+`HERMES_CLAUDE_SETTINGS_FILE` → no isolation, the pre-2026-07-11 Bad Janet
+gap), never when its VALUE differs from another instance's.
+
+## Distribution & releases
+
+Two engine repos:
+
+| Repo | Contents | Canonical for |
+|------|----------|---------------|
+| hermes-agent fork — GitHub, origin `duquesnay/hermes-claude-acp` (upstream `NousResearch/hermes-agent`); dev clone `~/dev/nestor/janet-test` | Hermès Python gateway | gateway code, C3 memory scripts, vendored plugin copy |
+| `claude-channels-hermes` — GitHub `duquesnay/claude-channels-hermes` | ACP supervisor (`acp/`) + `hermes-channel` plugin (`marketplace/external_plugins/hermes-channel/`) | supervisor + plugin source |
+
+### Vendored plugin (travels with the Python repo)
+
+The `hermes-channel` plugin is vendored inside the Python repo at
+`plugins/claude-channels-hermes/marketplace/external_plugins/hermes-channel/`
+so a `git pull` of the engine carries the matching plugin. It is synced FROM
+canonical via `scripts/deploy-plugin.sh <vendored_dir>` (this repo):
+file-level sync of `server.ts`, `stop_hook_fallback.ts`, `.mcp.json`,
+`plugin.json`, lockfiles and tests — no `--delete`, the target's runtime
+artifacts (timing logs, node_modules) are untouched — then writes `VERSION` =
+`git describe --always --dirty` + deploy date (e.g.
+`6ac1a3f 2026-07-11T18:00:17+0700`). Never edit the vendored copy directly:
+fix canonical, re-run the script.
+
+### Runtime copies (per instance)
+
+Instances do not run a repo checkout of `acp/`: `config.yaml`'s `acp_args`
+points at a deployed copy (e.g. `$HERMES_HOME/acp/src/acp_entrypoint.ts`).
+Deploy with `scripts/deploy-acp.sh <target_dir>`: timestamped backup
+(`mv → .bak-<ts>`), rsync of the deployable subset (`src/`, `launcher.exp`,
+`package.json`, `bun.lock`, `tsconfig.json` — never node_modules or logs),
+`bun install` in the target, `VERSION` file. Both deploy scripts refuse a
+nonexistent target without `--init` (typo guard) and are idempotent.
+
+`VERSION` files are the deployment audit trail: compare a live copy's
+`VERSION` against `git describe --always --dirty` in canonical to know what
+an instance actually runs.
+
+### Updating an instance
+
+1. `git fetch` + `git merge --ff-only` in the instance's engine checkout —
+   conscious deploy (policy 2026-07-08): the startup wrapper never auto-pulls,
+   restart = reload, not deploy.
+2. Re-run the deploy scripts for the runtime copies the instance consumes
+   (`deploy-acp.sh $HERMES_HOME/acp`; `deploy-plugin.sh …` where a deployed
+   plugin copy is used).
+3. Scoped restart only: `launchctl bootout` + `bootstrap` when plist env
+   changed, else `hermes gateway run --replace` under the matching
+   `HERMES_HOME`. Never a broad pkill (see Prod-safety).
+
+### C3 memory mechanism — standard delivery
+
+The always-on ("Couche 3") memory for ACP sessions ships in the Python repo
+as two generic scripts (generalization of the prod-only
+`~/.hermes/refresh-acp-memory.py` + `~/.local/bin/janet-startup.sh`):
+
+- `scripts/refresh-acp-memory.py` — rewrites ONLY the fenced `HERMES-MEMORY`
+  region of the sandbox `CLAUDE.md` from the instance memory store (USER
+  profile + curated MEMORY notes). `HERMES_HOME` from env, sandbox
+  overridable via `HERMES_ACP_SANDBOX`; idempotent, SOUL/identity preserved.
+- `scripts/instance-startup.sh` — generic launchd-friendly wrapper: resolve
+  env → refresh C3 memory (non-fatal) → `exec hermes gateway run` from
+  `HERMES_VENV`. Instance specifics are opt-in flags (`--env-file`,
+  `--greeting`, `--reboot-detect`, `--shutdown-hook`,
+  `--skip-memory-refresh`) — same mechanism everywhere, values per instance.
+
 ## Timeout stack
 
 Three layers watch a turn, from innermost to outermost. **The ordering is the
@@ -107,6 +194,10 @@ Layer (inner → outer)        Env var / setting                     Default    
 
 Required ordering: `guard < turn-timeout < gateway deadlines`
 (prod targets: `200000 < 270000 < 300000`).
+
+Both env vars are set at the supervisor level (section B): the supervisor
+reads `HERMES_CHANNELS_TURN_TIMEOUT_MS` itself; `HERMES_REPLY_CLOSE_GUARD_MS`
+is inherited by the spawned claude session and read by the plugin.
 
 - **Layer 1 — plugin guard** (`server.ts`): anti-wedge nudge if the model has
   not called `reply_close` yet; the turn can still complete normally after it.
@@ -149,8 +240,10 @@ the polluted `~/.claude` (user). Fix applied:
 Deferred (one change at a time): `HERMES_CLAUDE_ALLOWED_TOOLS` mirrors prod exactly, so
 it lists Janet's personal-world tools (gws, apple-mail, slack-admin) — inert since the
 isolated `claude-settings.json` doesn't enable those plugins. Wiring the Mantu toolset
-(m365) is a separate tested step: `allowedTools` is auto-approval, not plugin
-enablement — m365 must go into the isolated settings' `enabledPlugins` + marketplace.
+(m365-mcp, target per the access matrix above) is a separate tested step:
+`allowedTools` is auto-approval, not plugin enablement — m365 must go into the
+isolated settings' `enabledPlugins` + marketplace. This is a VALUES step for Bad
+Janet, not toolset alignment on prod (see the mechanism-vs-values rule).
 
 Pending: empirical verification on the next lazily-spawned Bad Janet session (confirm
 the claude cmdline carries `--settings` + `--setting-sources project,local` + cwd=sandbox
