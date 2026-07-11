@@ -14,7 +14,11 @@ import { describe, it, expect, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:net";
 import { unlinkSync, existsSync } from "node:fs";
-import { createAgent } from "./acp_server.ts";
+import {
+  createAgent,
+  resolveTurnTimeoutMs,
+  DEFAULT_TURN_TIMEOUT_MS,
+} from "./acp_server.ts";
 import { ChannelsSessionPool, PoolFullError } from "./session_pool.ts";
 import type { SessionState, PoolDeps } from "./session_pool.ts";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
@@ -586,5 +590,44 @@ describe("createAgent", () => {
     const agent = createAgent(conn, pool);
     const result = await agent.authenticate({} as any);
     expect(result).toBeDefined();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// resolveTurnTimeoutMs — HERMES_CHANNELS_TURN_TIMEOUT_MS parameterization
+//
+// The supervisor turn-timeout must be tunable per instance (prod target
+// 270_000ms) without editing code, and must NEVER be disabled by a broken
+// env value — it is the middle layer of the timeout stack (plugin guard <
+// supervisor turn-timeout < gateway deadlines, see ../CONFIGURATION.md).
+// -----------------------------------------------------------------------------
+
+describe("resolveTurnTimeoutMs", () => {
+  it("defaults to 120000 when the env var is unset", () => {
+    expect(resolveTurnTimeoutMs({})).toBe(DEFAULT_TURN_TIMEOUT_MS);
+    expect(DEFAULT_TURN_TIMEOUT_MS).toBe(120_000);
+  });
+
+  it("defaults when the env var is empty or blank", () => {
+    expect(resolveTurnTimeoutMs({ HERMES_CHANNELS_TURN_TIMEOUT_MS: "" })).toBe(
+      DEFAULT_TURN_TIMEOUT_MS,
+    );
+    expect(resolveTurnTimeoutMs({ HERMES_CHANNELS_TURN_TIMEOUT_MS: "  " })).toBe(
+      DEFAULT_TURN_TIMEOUT_MS,
+    );
+  });
+
+  it("uses the env value when it is a positive integer (prod target 270000)", () => {
+    expect(
+      resolveTurnTimeoutMs({ HERMES_CHANNELS_TURN_TIMEOUT_MS: "270000" }),
+    ).toBe(270_000);
+  });
+
+  it("falls back to the default on garbage, negative, zero or fractional values", () => {
+    for (const bad of ["abc", "-5000", "0", "1234.5", "NaN", "Infinity"]) {
+      expect(
+        resolveTurnTimeoutMs({ HERMES_CHANNELS_TURN_TIMEOUT_MS: bad }),
+      ).toBe(DEFAULT_TURN_TIMEOUT_MS);
+    }
   });
 });

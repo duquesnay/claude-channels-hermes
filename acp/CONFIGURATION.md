@@ -59,6 +59,7 @@ or directly in the launchd plist `EnvironmentVariables`.
 | `HERMES_SESSION_CWD` | session cwd = the persona sandbox | falls back to supervisor cwd (usually `$HOME` → `project` source = `~/.claude`, i.e. the user config again) |
 | `HERMES_CLAUDE_ALLOWED_TOOLS` | `--allowedTools` (space-separated string) | launcher default `mcp__…hermes-channel__* Read` |
 | `HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS` | when truthy → injects `ENABLE_CLAUDEAI_MCP_SERVERS=0` (kills claude.ai Gmail/Drive/Notes/Slack connectors) | unset = connectors ON (prod default) |
+| `HERMES_CHANNELS_TURN_TIMEOUT_MS` | supervisor per-turn timeout (positive integer ms; invalid → default) | `120000` — see "Timeout stack" below |
 
 **Critical coupling:** `HERMES_CLAUDE_SETTINGS_FILE` and `HERMES_SESSION_CWD` must be
 set *together*. `--setting-sources project,local` (added only in the launcher's
@@ -86,6 +87,36 @@ Persona (SOUL.md) + operational instructions (AGENTS.md) + heartbeat/proactive
 (HEARTBEAT.md). Seeded by `hermes_cli/default_soul.py` on first run. **Single
 source of truth for identity** — never duplicate the persona into a launcher's
 `--append-system-prompt`.
+
+## Timeout stack
+
+Three layers watch a turn, from innermost to outermost. **The ordering is the
+invariant**: each inner layer must fire BEFORE the next outer one, so the
+failure is handled at the cheapest level (guard nudges the model → supervisor
+ends the turn cleanly → gateway deadline is the last-resort wall). An inverted
+pair makes the outer layer mask the inner one and turns a recoverable miss
+into an empty reply.
+
+```
+Layer (inner → outer)        Env var / setting                     Default     Prod target
+---------------------------  ------------------------------------  ----------  -----------
+1. plugin reply_close guard  HERMES_REPLY_CLOSE_GUARD_MS           90000       200000
+2. supervisor turn-timeout   HERMES_CHANNELS_TURN_TIMEOUT_MS       120000      270000
+3. gateway deadlines         210s progress-aware / 300s hard wall  210s/300s   270s eff. / 300s
+```
+
+Required ordering: `guard < turn-timeout < gateway deadlines`
+(prod targets: `200000 < 270000 < 300000`).
+
+- **Layer 1 — plugin guard** (`server.ts`): anti-wedge nudge if the model has
+  not called `reply_close` yet; the turn can still complete normally after it.
+- **Layer 2 — supervisor turn-timeout** (`src/acp_server.ts`,
+  `resolveTurnTimeoutMs`): hard cap on `sendPrompt` for one turn. Invalid or
+  non-positive values fall back to the default — a broken env var can never
+  disable this layer.
+- **Layer 3 — gateway deadlines** (Hermès Python side): 210s progress-aware
+  deadline (reset on streamed chunks) and 300s absolute wall. Outermost; if
+  this fires, the user gets the timeout error path, not a composed reply.
 
 ## Reference config vs instance gap
 

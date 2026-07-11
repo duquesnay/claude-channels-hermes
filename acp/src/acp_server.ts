@@ -48,7 +48,33 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Default per-turn timeout in milliseconds. */
-const DEFAULT_TURN_TIMEOUT_MS = 120_000;
+export const DEFAULT_TURN_TIMEOUT_MS = 120_000;
+
+/**
+ * Resolve the per-turn timeout from HERMES_CHANNELS_TURN_TIMEOUT_MS.
+ *
+ * The supervisor turn-timeout must sit BETWEEN the plugin reply_close guard
+ * (HERMES_REPLY_CLOSE_GUARD_MS, below) and the gateway deadlines (above) —
+ * see ../CONFIGURATION.md "Timeout stack". Invalid or non-positive values
+ * fall back to the default so a broken env var can never disable the
+ * supervisor timeout.
+ */
+export function resolveTurnTimeoutMs(
+  env: Record<string, string | undefined> = process.env,
+): number {
+  const raw = env.HERMES_CHANNELS_TURN_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_TURN_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    process.stderr.write(
+      `acp-server: invalid HERMES_CHANNELS_TURN_TIMEOUT_MS=${JSON.stringify(raw)}, using default ${DEFAULT_TURN_TIMEOUT_MS}\n`,
+    );
+    return DEFAULT_TURN_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+const TURN_TIMEOUT_MS = resolveTurnTimeoutMs();
 
 /**
  * ACP _meta key used by Janet to supply the session key.
@@ -190,7 +216,7 @@ class ClaudeAgent implements Agent {
 
     let content: string;
     try {
-      content = await state.client.sendPrompt(promptText, DEFAULT_TURN_TIMEOUT_MS, onChunk);
+      content = await state.client.sendPrompt(promptText, TURN_TIMEOUT_MS, onChunk);
     } catch (err) {
       process.stderr.write(
         `acp-server: prompt failed for session ${sessionId}: ${err}\n`
