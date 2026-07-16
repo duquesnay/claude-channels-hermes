@@ -97,6 +97,10 @@ interface StreamEntry {
   hermes_conn: Socket
   startedAt: number
   accumulatedText: string
+  // V2 streaming: bytes of accumulatedText already relayed as chunk deltas.
+  // reply_chunk receives FULL accumulated text each call; we emit only the
+  // suffix past this offset so the client sees ordered, non-overlapping deltas.
+  sentLength: number
 }
 
 export const streams = new Map<string, StreamEntry>()
@@ -120,7 +124,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'reply_chunk',
-      description: 'Accumulate reply text in progress. Pass FULL accumulated text each time, not a delta. No-op in V1 (stored locally, not relayed). Requires a handle from reply_open.',
+      description: 'Send a progress update. Pass FULL accumulated text each time, not a delta — the plugin relays only the new suffix to Hermes so the user sees your reply grow live. Requires a handle from reply_open.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -178,6 +182,7 @@ export async function handleReplyOpen(args: Record<string, unknown>) {
     hermes_conn: pending.conn,
     startedAt: pending.startedAt,
     accumulatedText: '',
+    sentLength: 0,
   })
   pendingByRequestId.delete(chat_id)
   // JA-24: ts lets us split inbound->reply_open ("tax" of the first, empty-handed
@@ -192,6 +197,20 @@ export async function handleReplyChunk(args: Record<string, unknown>) {
   const s = streams.get(handle)
   if (!s) throw new Error(`reply_chunk: unknown handle ${handle}`)
   s.accumulatedText = text
+  // V2 relay: emit only the new suffix as a chunk delta. The supervisor turns
+  // each delta into an agent_message_chunk session/update; the terminal result
+  // (reply_close) still carries the full text and reconciles any tail. Emitting
+  // deltas (not the cumulative text) keeps the client's ordered stream correct.
+  const delta = text.slice(s.sentLength)
+  if (delta.length > 0) {
+    const chunk = JSON.stringify({
+      type: 'chunk',
+      request_id: s.request_id,
+      content: delta,
+    }) + '\n'
+    s.hermes_conn.write(chunk)
+    s.sentLength = text.length
+  }
   return { content: [{ type: 'text', text: 'queued' }] }
 }
 

@@ -127,8 +127,10 @@ describe('reply_open + reply_close by handle (advanced path, still supported)', 
     const closeResult = await handleReplyClose({ handle, text: 'final via handle' })
 
     expect(closeResult.content[0].text).toBe('closed')
-    const payload = JSON.parse(conn.writes[0])
-    expect(payload).toMatchObject({ request_id: 'chat-4', content: 'final via handle' })
+    // V2: reply_chunk relays a chunk delta first; the result is the terminal write.
+    expect(JSON.parse(conn.writes[0])).toMatchObject({ type: 'chunk', content: 'partial...' })
+    const payload = JSON.parse(conn.writes[conn.writes.length - 1])
+    expect(payload).toMatchObject({ type: 'result', request_id: 'chat-4', content: 'final via handle' })
     expect(streams.has(handle)).toBe(false)
   })
 
@@ -142,7 +144,9 @@ describe('reply_open + reply_close by handle (advanced path, still supported)', 
 
     await handleReplyClose({ handle })
 
-    const payload = JSON.parse(conn.writes[0])
-    expect(payload.content).toBe('accumulated so far')
+    // V2: writes[0] is the relayed chunk; the terminal result carries the
+    // fallback text (the last reply_chunk accumulation).
+    const payload = JSON.parse(conn.writes[conn.writes.length - 1])
+    expect(payload).toMatchObject({ type: 'result', content: 'accumulated so far' })
   })
 })
