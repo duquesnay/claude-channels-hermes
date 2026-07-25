@@ -32,6 +32,8 @@ import {
   PoolFullError,
   socketPathForKey,
   sessionNameForKey,
+  resolveClaudeModel,
+  DEFAULT_CLAUDE_MODEL,
 } from "./session_pool.ts";
 import type { PoolDeps, SessionState } from "./session_pool.ts";
 import type { HermesChannelClientInterface } from "./hermes_channel_client.ts";
@@ -1678,6 +1680,103 @@ describe("HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS", () => {
       delete process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"];
     } else {
       process.env["HERMES_CLAUDE_NO_ACCOUNT_CONNECTORS"] = origEnv;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+});
+
+describe("HERMES_CLAUDE_MODEL", () => {
+  it("defaults to haiku when unset — the pre-parameter behaviour", () => {
+    expect(resolveClaudeModel({})).toBe("haiku");
+    expect(DEFAULT_CLAUDE_MODEL).toBe("haiku");
+  });
+
+  it("falls back to the default when set but empty or blank", () => {
+    // An env var exported as "" (a common shell accident) must not spawn a
+    // session with an empty --model flag.
+    expect(resolveClaudeModel({ HERMES_CLAUDE_MODEL: "" })).toBe("haiku");
+    expect(resolveClaudeModel({ HERMES_CLAUDE_MODEL: "   " })).toBe("haiku");
+  });
+
+  it("honours an explicit alias, trimming stray whitespace", () => {
+    expect(resolveClaudeModel({ HERMES_CLAUDE_MODEL: "sonnet" })).toBe("sonnet");
+    expect(resolveClaudeModel({ HERMES_CLAUDE_MODEL: " sonnet\n" })).toBe("sonnet");
+  });
+
+  it("passes the resolved model to the launcher env on spawn", async () => {
+    const origEnv = process.env["HERMES_CLAUDE_MODEL"];
+    process.env["HERMES_CLAUDE_MODEL"] = "sonnet";
+
+    const fakeServers = new Map<string, Server>();
+    const spawnedEnvs: Record<string, string>[] = [];
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnedEnvs.push(env);
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 88003;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("model-spawn-key");
+
+    expect(spawnedEnvs.length).toBe(1);
+    expect(spawnedEnvs[0]["HERMES_CLAUDE_MODEL"]).toBe("sonnet");
+
+    if (origEnv === undefined) {
+      delete process.env["HERMES_CLAUDE_MODEL"];
+    } else {
+      process.env["HERMES_CLAUDE_MODEL"] = origEnv;
+    }
+
+    for (const [socketPath, server] of fakeServers) {
+      await stopFakeSocket(server, socketPath);
+    }
+  });
+
+  it("still passes an explicit model when the env var is absent", async () => {
+    // The launcher has its own default, but the pool must not stay silent:
+    // what the pool reports via set_config_option has to match what it spawned.
+    const origEnv = process.env["HERMES_CLAUDE_MODEL"];
+    delete process.env["HERMES_CLAUDE_MODEL"];
+
+    const fakeServers = new Map<string, Server>();
+    const spawnedEnvs: Record<string, string>[] = [];
+
+    const deps: Partial<PoolDeps> = {
+      spawnLauncher(_launcherExpPath, env) {
+        spawnedEnvs.push(env);
+        const socketPath = env["HERMES_CHANNEL_SOCKET"]!;
+        void startFakeSocket(socketPath).then((srv) => fakeServers.set(socketPath, srv));
+        return 88004;
+      },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) {},
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return true; },
+      killByName(_name) {},
+    };
+
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps);
+    await pool.getOrCreate("model-default-spawn-key");
+
+    expect(spawnedEnvs.length).toBe(1);
+    expect(spawnedEnvs[0]["HERMES_CLAUDE_MODEL"]).toBe("haiku");
+
+    if (origEnv !== undefined) {
+      process.env["HERMES_CLAUDE_MODEL"] = origEnv;
     }
 
     for (const [socketPath, server] of fakeServers) {

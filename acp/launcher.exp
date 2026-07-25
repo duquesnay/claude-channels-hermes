@@ -8,6 +8,12 @@
 #   HERMES_SESSION_NAME     The --name for the claude process (claude_hermes_<hash8>).
 #                           Scoped per session_key — used for targeted kill on eviction.
 #   HERMES_SESSION_CWD      Working directory for the claude session.
+#   HERMES_CLAUDE_MODEL     Model alias for the claude session (default: haiku).
+#                           The model is fixed for the LIFETIME of the process:
+#                           claude takes it as a spawn flag, so changing it
+#                           requires a respawn, not a live switch. The ACP
+#                           supervisor reports this value back to Hermes via
+#                           session/set_config_option (see acp_server.ts).
 #
 # PTY is required so claude can receive the dev-channels TUI confirmation.
 # Two blind Enters dismiss the TUI prompt (no-op if not shown).
@@ -33,6 +39,13 @@ set settings_file [expr { [info exists env(HERMES_CLAUDE_SETTINGS_FILE)] ? $env(
 # HERMES_CLAUDE_ALLOWED_TOOLS to include its full plugin set (space-separated,
 # passed as a single string — same shape as the hardcoded default below).
 set allowed_tools [expr { [info exists env(HERMES_CLAUDE_ALLOWED_TOOLS)] && $env(HERMES_CLAUDE_ALLOWED_TOOLS) ne "" ? $env(HERMES_CLAUDE_ALLOWED_TOOLS) : "mcp__plugin_hermes-channel_hermes-channel__* Read" }]
+# Model alias (haiku | sonnet | default). Default "haiku" keeps every existing
+# instance byte-identical to the hardcoded behaviour this replaced. Whoever sets
+# this must also align Hermes' own `model.default` in config.yaml: the supervisor
+# answers session/set_config_option with the value in force HERE, and the Hermes
+# client raises when the two disagree (deliberate — a silent mismatch used to
+# mean paying for a model nobody chose).
+set claude_model [expr { [info exists env(HERMES_CLAUDE_MODEL)] && $env(HERMES_CLAUDE_MODEL) ne "" ? $env(HERMES_CLAUDE_MODEL) : "haiku" }]
 
 cd $session_cwd
 
@@ -41,7 +54,7 @@ if {$settings_file ne ""} {
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode auto \
-        --model haiku \
+        --model $claude_model \
         --setting-sources project,local \
         --settings $settings_file \
         --allowedTools $allowed_tools
@@ -50,7 +63,7 @@ if {$settings_file ne ""} {
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode auto \
-        --model haiku \
+        --model $claude_model \
         --allowedTools $allowed_tools
 }
 
