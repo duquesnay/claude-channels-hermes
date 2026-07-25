@@ -8,6 +8,10 @@
 #   HERMES_SESSION_NAME     The --name for the claude process (claude_hermes_<hash8>).
 #                           Scoped per session_key — used for targeted kill on eviction.
 #   HERMES_SESSION_CWD      Working directory for the claude session.
+#   HERMES_CLAUDE_BIN       Path to the claude binary (default: $HOME/.local/bin/claude).
+#                           Resolved per instance so each Hermes home uses ITS OWN
+#                           claude install — this file is deployed verbatim under
+#                           several user accounts.
 #   HERMES_CLAUDE_MODEL     Model alias for the claude session (default: haiku).
 #                           The model is fixed for the LIFETIME of the process:
 #                           claude takes it as a spawn flag, so changing it
@@ -46,11 +50,20 @@ set allowed_tools [expr { [info exists env(HERMES_CLAUDE_ALLOWED_TOOLS)] && $env
 # client raises when the two disagree (deliberate — a silent mismatch used to
 # mean paying for a model nobody chose).
 set claude_model [expr { [info exists env(HERMES_CLAUDE_MODEL)] && $env(HERMES_CLAUDE_MODEL) ne "" ? $env(HERMES_CLAUDE_MODEL) : "haiku" }]
+# Claude binary. This file is deployed verbatim into several Hermes homes owned
+# by DIFFERENT user accounts, so an absolute path here makes one instance depend
+# on another user's install — Bad Janet (gduquesnay) was running guillaume's
+# binary. Resolve per instance from HOME instead; the supervisors do export it
+# (verified live: HOME=/Users/gduquesnay for Bad Janet's pool).
+# The literal fallback only covers a HOME-less environment, which the pool never
+# produces — it exists so a hand-run launcher degrades to the historical path
+# rather than spawning "/.local/bin/claude".
+set claude_bin [expr { [info exists env(HERMES_CLAUDE_BIN)] && $env(HERMES_CLAUDE_BIN) ne "" ? $env(HERMES_CLAUDE_BIN) : ([info exists env(HOME)] && $env(HOME) ne "" ? "$env(HOME)/.local/bin/claude" : "/Users/guillaume/.local/bin/claude") }]
 
 cd $session_cwd
 
 if {$settings_file ne ""} {
-    spawn /Users/guillaume/.local/bin/claude \
+    spawn $claude_bin \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode auto \
@@ -59,7 +72,7 @@ if {$settings_file ne ""} {
         --settings $settings_file \
         --allowedTools $allowed_tools
 } else {
-    spawn /Users/guillaume/.local/bin/claude \
+    spawn $claude_bin \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode auto \
