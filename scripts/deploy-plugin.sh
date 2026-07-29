@@ -22,7 +22,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SRC_DIR="${REPO_ROOT}/marketplace/external_plugins/hermes-channel"
+# shellcheck source=deploy-manifest.sh
+source "${SCRIPT_DIR}/deploy-manifest.sh"
+SRC_DIR="${REPO_ROOT}/${PLUGIN_SRC_SUBDIR}"
 
 usage() {
   echo "usage: $(basename "$0") <target_plugin_dir> [--init]" >&2
@@ -53,16 +55,7 @@ if [ ! -d "$TARGET" ]; then
   mkdir -p "$TARGET"
 fi
 
-rsync -a \
-  --include='/server.ts' \
-  --include='/stop_hook_fallback.ts' \
-  --include='/.mcp.json' \
-  --include='/.claude-plugin/***' \
-  --include='/package.json' \
-  --include='/bun.lock' \
-  --include='/*.test.ts' \
-  --exclude='*' \
-  "${SRC_DIR}/" "${TARGET}/"
+rsync -a "${PLUGIN_RSYNC_FILTER[@]}" "${SRC_DIR}/" "${TARGET}/"
 
 DESCRIBE="$(git -C "$REPO_ROOT" describe --always --dirty)"
 printf '%s %s\n' "$DESCRIBE" "$(date '+%Y-%m-%dT%H:%M:%S%z')" > "${TARGET}/VERSION"

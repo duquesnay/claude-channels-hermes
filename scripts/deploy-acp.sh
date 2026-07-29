@@ -23,7 +23,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-SRC_DIR="${REPO_ROOT}/acp"
+# shellcheck source=deploy-manifest.sh
+source "${SCRIPT_DIR}/deploy-manifest.sh"
+SRC_DIR="${REPO_ROOT}/${ACP_SRC_SUBDIR}"
 
 usage() {
   echo "usage: $(basename "$0") <target_dir> [--init]" >&2
@@ -59,14 +61,7 @@ else
   mkdir -p "$TARGET"
 fi
 
-rsync -a \
-  --include='/src/***' \
-  --include='/launcher.exp' \
-  --include='/package.json' \
-  --include='/bun.lock' \
-  --include='/tsconfig.json' \
-  --exclude='*' \
-  "${SRC_DIR}/" "${TARGET}/"
+rsync -a "${ACP_RSYNC_FILTER[@]}" "${SRC_DIR}/" "${TARGET}/"
 
 bun install --cwd "$TARGET"
 
