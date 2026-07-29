@@ -50,6 +50,11 @@ import {
   HermesChannelClient,
   type HermesChannelClientInterface,
 } from "./hermes_channel_client.ts";
+import {
+  PluginOrphanSweeper,
+  isSweepEnabled,
+  type OrphanSweeperInterface,
+} from "./plugin_orphan_sweep.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -462,9 +467,23 @@ export class ChannelsSessionPool {
   private readonly deps: PoolDeps;
   private evictionTimer: ReturnType<typeof setInterval> | undefined;
 
-  constructor(launcherExpPath: string, deps: Partial<PoolDeps> = {}) {
+  /**
+   * Gap (d), JA-41: the ps-based sweep for plugin processes that no socket
+   * file can lead us to. Undefined when disabled by env — see
+   * plugin_orphan_sweep.ts for why it defaults to on.
+   */
+  private readonly orphanSweeper: OrphanSweeperInterface | undefined;
+
+  constructor(
+    launcherExpPath: string,
+    deps: Partial<PoolDeps> = {},
+    orphanSweeper?: OrphanSweeperInterface
+  ) {
     this.launcherExpPath = launcherExpPath;
     this.deps = { ...PRODUCTION_DEPS, ...deps };
+    this.orphanSweeper =
+      orphanSweeper ??
+      (isSweepEnabled() ? new PluginOrphanSweeper(launcherExpPath) : undefined);
   }
 
   // --------------------------------------------------------------------------
@@ -836,16 +855,33 @@ export class ChannelsSessionPool {
    *
    * Gap (b): reconcileOrphans() runs on the SAME tick as scanAndEvictIdle —
    * the in-memory Map scan catches idle sessions THIS process knows about;
-   * the OS-level sweep catches sessions it never knew about (survivors of a
-   * prior, now-dead, instance of this same pool).
+   * the socket-directory sweep catches sessions it never knew about
+   * (survivors of a prior, now-dead, instance of this same pool).
+   *
+   * Gap (d), JA-41: sweepPluginOrphans() joins the same tick for the classes
+   * NO socket file can lead us to at all — the plugin's own fixed-path socket
+   * lives outside the channels dir, interactive (non-pool) sessions never had
+   * a channels socket, and a spawn stuck before waitForSocket() never created
+   * one. See plugin_orphan_sweep.ts.
    */
   startIdleEviction(): void {
     if (this.evictionTimer !== undefined) return;
     this.evictionTimer = setInterval(() => {
       void this.scanAndEvictIdle(this.deps.now());
       void this.reconcileOrphans();
+      void this.sweepPluginOrphans();
     }, EVICTION_INTERVAL_MS);
     this.evictionTimer.unref();
+  }
+
+  /**
+   * Gap (d): run one ps-based plugin-orphan sweep, or nothing at all if the
+   * sweep is disabled for this instance. A thin delegate rather than an
+   * inline call so the wiring itself is directly testable without waiting out
+   * a real eviction interval.
+   */
+  async sweepPluginOrphans(): Promise<void> {
+    await this.orphanSweeper?.sweep();
   }
 
   /**

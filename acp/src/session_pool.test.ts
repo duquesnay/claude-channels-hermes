@@ -1062,6 +1062,33 @@ describe("reconcileOrphans (gap b)", () => {
     }
   });
 
+  // Gap (d), JA-41: the socket-directory reconcile above and the ps-based
+  // plugin-orphan sweep are complementary, not alternatives — the pool must
+  // run BOTH. This asserts the wiring only; what the sweep actually selects
+  // and kills is covered by plugin_orphan_sweep.test.ts.
+  it("delegates the JA-41 plugin-orphan sweep to the injected sweeper", async () => {
+    let sweeps = 0;
+    const deps: PoolDeps = {
+      spawnLauncher() { throw new Error("should not spawn"); },
+      createClient(_socketPath) { return makeMockClient(0); },
+      killPid(_pid, _signal) { throw new Error("the pool must not kill anything itself here"); },
+      killSocketHolders(_socketPath) {},
+      now() { return Date.now(); },
+      isPidAlive(_pid) { return false; },
+      killByName(_name) { throw new Error("never name-based"); },
+      listSocketHolderPids(_socketPath) { return []; },
+      getPpid(_pid) { return undefined; },
+      getCommandLine(_pid) { return undefined; },
+    };
+    const pool = new ChannelsSessionPool("/fake/launcher.exp", deps, {
+      async sweep() { sweeps++; return []; },
+    });
+
+    await pool.sweepPluginOrphans();
+
+    expect(sweeps).toBe(1);
+  });
+
   it("is a no-op when the channels directory does not exist yet", async () => {
     const deps: PoolDeps = {
       spawnLauncher() { throw new Error("should not spawn"); },
