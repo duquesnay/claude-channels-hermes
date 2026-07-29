@@ -74,6 +74,33 @@ function getMinWarm(): number {
   return Number(process.env["HERMES_CHANNELS_MIN_WARM"] ?? 0);
 }
 
+/**
+ * Model alias used when HERMES_CLAUDE_MODEL is unset.
+ * MUST stay in sync with the same default in launcher.exp — the launcher is
+ * what actually passes --model to claude; this constant is what the supervisor
+ * REPORTS (see acp_server.ts session/set_config_option). If the two drift, the
+ * supervisor would tell Hermes a model the session is not running.
+ */
+export const DEFAULT_CLAUDE_MODEL = "haiku";
+
+/**
+ * Resolve the model alias the spawned claude sessions run with.
+ *
+ * The model is a spawn-time flag, not a live setting: it is fixed for the
+ * lifetime of each claude process, so switching models means respawning the
+ * pool, never mutating a running session.
+ *
+ * Read at call time (not module load) so tests and a supervisor restart pick up
+ * the current env without a rebuild.
+ */
+export function resolveClaudeModel(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  const raw = env["HERMES_CLAUDE_MODEL"];
+  if (raw === undefined || raw.trim() === "") return DEFAULT_CLAUDE_MODEL;
+  return raw.trim();
+}
+
 /** Wait budget for the expect launcher to bind the socket. */
 const SOCKET_WAIT_MS = 75_000;
 
@@ -555,6 +582,12 @@ export class ChannelsSessionPool {
           // instance sandbox (e.g. ~/.janet-test/acp-sandbox) and the claude session
           // loads the right CLAUDE.md + .mcp.json. Falls back to the supervisor cwd.
           HERMES_SESSION_CWD: process.env.HERMES_SESSION_CWD ?? process.cwd(),
+          // Model: passed explicitly rather than relying on the launcher's own
+          // env lookup, so the value the pool BELIEVES is in force is the value
+          // the launcher receives. That single resolution point is what lets
+          // the supervisor answer session/set_config_option truthfully, and it
+          // is the seam a future per-session-key model choice hangs off.
+          HERMES_CLAUDE_MODEL: resolveClaudeModel(),
           ...(noAccountConnectors && { ENABLE_CLAUDEAI_MCP_SERVERS: "0" }),
         },
         // Gap (c): react the moment this exact child dies, whatever the

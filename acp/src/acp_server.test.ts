@@ -18,6 +18,8 @@ import {
   createAgent,
   resolveTurnTimeoutMs,
   DEFAULT_TURN_TIMEOUT_MS,
+  buildModelConfigOption,
+  MODEL_CONFIG_ID,
 } from "./acp_server.ts";
 import { ChannelsSessionPool, PoolFullError } from "./session_pool.ts";
 import type { SessionState, PoolDeps } from "./session_pool.ts";
@@ -629,5 +631,81 @@ describe("resolveTurnTimeoutMs", () => {
         resolveTurnTimeoutMs({ HERMES_CHANNELS_TURN_TIMEOUT_MS: bad }),
       ).toBe(DEFAULT_TURN_TIMEOUT_MS);
     }
+  });
+});
+
+describe("session/set_config_option — model reporting", () => {
+  function withModelEnv<T>(value: string | undefined, fn: () => T): T {
+    const original = process.env["HERMES_CLAUDE_MODEL"];
+    if (value === undefined) delete process.env["HERMES_CLAUDE_MODEL"];
+    else process.env["HERMES_CLAUDE_MODEL"] = value;
+    try {
+      return fn();
+    } finally {
+      if (original === undefined) delete process.env["HERMES_CLAUDE_MODEL"];
+      else process.env["HERMES_CLAUDE_MODEL"] = original;
+    }
+  }
+
+  it("is implemented — the whole point is to stop answering -32601", () => {
+    const { conn } = makeMockConnection();
+    const agent = createAgent(conn, makeMockPool());
+    expect(typeof (agent as any).setSessionConfigOption).toBe("function");
+  });
+
+  it("reports the model in force, not the value the client asked for", async () => {
+    const { conn } = makeMockConnection();
+    const agent = createAgent(conn, makeMockPool());
+
+    const result = await withModelEnv("haiku", () =>
+      (agent as any).setSessionConfigOption({
+        sessionId: "s1",
+        configId: MODEL_CONFIG_ID,
+        value: "sonnet", // client asks for something the session is NOT running
+      }),
+    );
+
+    const opt = result.configOptions.find((o: any) => o.id === MODEL_CONFIG_ID);
+    expect(opt.currentValue).toBe("haiku");
+  });
+
+  it("confirms the pin when client and session agree", async () => {
+    const { conn } = makeMockConnection();
+    const agent = createAgent(conn, makeMockPool());
+
+    const result = await withModelEnv("sonnet", () =>
+      (agent as any).setSessionConfigOption({
+        sessionId: "s2",
+        configId: MODEL_CONFIG_ID,
+        value: "sonnet",
+      }),
+    );
+
+    const opt = result.configOptions.find((o: any) => o.id === MODEL_CONFIG_ID);
+    expect(opt.currentValue).toBe("sonnet");
+  });
+
+  it("rejects an unknown config option instead of silently succeeding", async () => {
+    const { conn } = makeMockConnection();
+    const agent = createAgent(conn, makeMockPool());
+
+    await expect(
+      (agent as any).setSessionConfigOption({
+        sessionId: "s3",
+        configId: "thought_level",
+        value: "high",
+      }),
+    ).rejects.toThrow(/thought_level/);
+  });
+
+  it("advertises only the running model as a choice — a session cannot switch", () => {
+    const opt = buildModelConfigOption({ HERMES_CLAUDE_MODEL: "sonnet" });
+    expect(opt.type).toBe("select");
+    expect(opt.currentValue).toBe("sonnet");
+    expect(opt.options).toEqual([{ value: "sonnet", name: "sonnet" }]);
+  });
+
+  it("falls back to the launcher default when no model env is set", () => {
+    expect(buildModelConfigOption({}).currentValue).toBe("haiku");
   });
 });

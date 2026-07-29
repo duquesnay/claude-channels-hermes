@@ -8,6 +8,16 @@
 #   HERMES_SESSION_NAME     The --name for the claude process (claude_hermes_<hash8>).
 #                           Scoped per session_key — used for targeted kill on eviction.
 #   HERMES_SESSION_CWD      Working directory for the claude session.
+#   HERMES_CLAUDE_BIN       Path to the claude binary (default: $HOME/.local/bin/claude).
+#                           Resolved per instance so each Hermes home uses ITS OWN
+#                           claude install — this file is deployed verbatim under
+#                           several user accounts.
+#   HERMES_CLAUDE_MODEL     Model alias for the claude session (default: haiku).
+#                           The model is fixed for the LIFETIME of the process:
+#                           claude takes it as a spawn flag, so changing it
+#                           requires a respawn, not a live switch. The ACP
+#                           supervisor reports this value back to Hermes via
+#                           session/set_config_option (see acp_server.ts).
 #
 # PTY is required so claude can receive the dev-channels TUI confirmation.
 # Two blind Enters dismiss the TUI prompt (no-op if not shown).
@@ -33,24 +43,40 @@ set settings_file [expr { [info exists env(HERMES_CLAUDE_SETTINGS_FILE)] ? $env(
 # HERMES_CLAUDE_ALLOWED_TOOLS to include its full plugin set (space-separated,
 # passed as a single string — same shape as the hardcoded default below).
 set allowed_tools [expr { [info exists env(HERMES_CLAUDE_ALLOWED_TOOLS)] && $env(HERMES_CLAUDE_ALLOWED_TOOLS) ne "" ? $env(HERMES_CLAUDE_ALLOWED_TOOLS) : "mcp__plugin_hermes-channel_hermes-channel__* Read" }]
+# Model alias (haiku | sonnet | default). Default "haiku" keeps every existing
+# instance byte-identical to the hardcoded behaviour this replaced. Whoever sets
+# this must also align Hermes' own `model.default` in config.yaml: the supervisor
+# answers session/set_config_option with the value in force HERE, and the Hermes
+# client raises when the two disagree (deliberate — a silent mismatch used to
+# mean paying for a model nobody chose).
+set claude_model [expr { [info exists env(HERMES_CLAUDE_MODEL)] && $env(HERMES_CLAUDE_MODEL) ne "" ? $env(HERMES_CLAUDE_MODEL) : "haiku" }]
+# Claude binary. This file is deployed verbatim into several Hermes homes owned
+# by DIFFERENT user accounts, so an absolute path here makes one instance depend
+# on another user's install — Bad Janet (gduquesnay) was running guillaume's
+# binary. Resolve per instance from HOME instead; the supervisors do export it
+# (verified live: HOME=/Users/gduquesnay for Bad Janet's pool).
+# The literal fallback only covers a HOME-less environment, which the pool never
+# produces — it exists so a hand-run launcher degrades to the historical path
+# rather than spawning "/.local/bin/claude".
+set claude_bin [expr { [info exists env(HERMES_CLAUDE_BIN)] && $env(HERMES_CLAUDE_BIN) ne "" ? $env(HERMES_CLAUDE_BIN) : ([info exists env(HOME)] && $env(HOME) ne "" ? "$env(HOME)/.local/bin/claude" : "/Users/guillaume/.local/bin/claude") }]
 
 cd $session_cwd
 
 if {$settings_file ne ""} {
-    spawn /Users/guillaume/.local/bin/claude \
+    spawn $claude_bin \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode dontAsk \
-        --model haiku \
+        --model $claude_model \
         --setting-sources project,local \
         --settings $settings_file \
         --allowedTools $allowed_tools
 } else {
-    spawn /Users/guillaume/.local/bin/claude \
+    spawn $claude_bin \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
         --permission-mode dontAsk \
-        --model haiku \
+        --model $claude_model \
         --allowedTools $allowed_tools
 }
 

@@ -41,8 +41,10 @@ import type {
   AuthenticateRequest,
   CancelNotification,
   CloseSessionRequest,
+  SetSessionConfigOptionRequest,
+  SetSessionConfigOptionResponse,
 } from "@agentclientprotocol/sdk";
-import { ChannelsSessionPool, PoolFullError } from "./session_pool.ts";
+import { ChannelsSessionPool, PoolFullError, resolveClaudeModel } from "./session_pool.ts";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -81,6 +83,33 @@ const TURN_TIMEOUT_MS = resolveTurnTimeoutMs();
  * Python side: `_meta["hermes.channels/session_key"]`
  */
 const SESSION_KEY_META = "hermes.channels/session_key";
+
+/** The only config option this agent exposes. */
+export const MODEL_CONFIG_ID = "model";
+
+/**
+ * Build the `model` config option describing the model actually in force.
+ *
+ * Exposed as a select whose only choice is the running model: the model is a
+ * spawn-time flag on the claude process, so a session cannot switch models —
+ * offering alternatives here would advertise a capability we do not have.
+ */
+export function buildModelConfigOption(
+  env: Record<string, string | undefined> = process.env,
+) {
+  const model = resolveClaudeModel(env);
+  return {
+    id: MODEL_CONFIG_ID,
+    name: "Model",
+    category: "model",
+    description:
+      "Model the pooled claude session was spawned with (HERMES_CLAUDE_MODEL). " +
+      "Fixed for the lifetime of the session — changing it requires a pool respawn.",
+    type: "select" as const,
+    currentValue: model,
+    options: [{ value: model, name: model }],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // ClaudeAgent
@@ -255,6 +284,61 @@ class ClaudeAgent implements Agent {
       stopReason: "end_turn",
       _meta: { session_generation: state.generation },
     } as PromptResponse & { _meta: Record<string, unknown> };
+  }
+
+  // --------------------------------------------------------------------------
+  // setSessionConfigOption — report the model actually in force
+  // --------------------------------------------------------------------------
+
+  /**
+   * Answer `session/set_config_option` truthfully instead of -32601.
+   *
+   * Hermes pins its configured model on every new session (config.yaml
+   * `model.default` → `_send_model_config` in acp_client_session.py). Until now
+   * this agent did not implement the method, so the pin was answered
+   * method-not-found, tolerated by the client, and dropped: config.yaml claimed
+   * a model while launcher.exp silently decided the real one. They happened to
+   * agree, which is exactly what made the gap invisible.
+   *
+   * The response therefore reports the model the session is REALLY running
+   * (HERMES_CLAUDE_MODEL, same resolution the pool used to spawn it) — never an
+   * echo of the requested value. When the two disagree the Hermes client raises
+   * rather than continuing, which is the intended outcome: the alternative is
+   * paying for a model nobody selected. Fixing such a mismatch means aligning
+   * config.yaml and HERMES_CLAUDE_MODEL, then restarting the supervisor.
+   *
+   * Note this cannot APPLY a model: claude takes --model at spawn, so honouring
+   * a different value would mean tearing down and respawning the session
+   * mid-conversation. We report; we do not pretend to switch.
+   */
+  async setSessionConfigOption(
+    params: SetSessionConfigOptionRequest,
+  ): Promise<SetSessionConfigOptionResponse> {
+    const { sessionId, configId } = params;
+    const requested = (params as { value?: unknown }).value;
+    const option = buildModelConfigOption();
+
+    if (configId !== MODEL_CONFIG_ID) {
+      // Unknown option: say so loudly rather than returning a success that
+      // silently ignored the request — the failure mode this method exists to
+      // remove in the first place.
+      throw new Error(
+        `acp-server: unsupported config option ${JSON.stringify(configId)} ` +
+          `(this agent exposes only ${JSON.stringify(MODEL_CONFIG_ID)})`,
+      );
+    }
+
+    if (requested !== option.currentValue) {
+      process.stderr.write(
+        `acp-server: MODEL MISMATCH session=${sessionId} — Hermes asked for ` +
+          `${JSON.stringify(requested)} but the pooled session runs ` +
+          `${JSON.stringify(option.currentValue)}. The session keeps the model it ` +
+          `was spawned with. Align config.yaml model.default with ` +
+          `HERMES_CLAUDE_MODEL and restart the supervisor.\n`,
+      );
+    }
+
+    return { configOptions: [option] } as SetSessionConfigOptionResponse;
   }
 
   // --------------------------------------------------------------------------
