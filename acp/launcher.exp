@@ -40,7 +40,7 @@ if {$settings_file ne ""} {
     spawn /Users/guillaume/.local/bin/claude \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
-        --permission-mode auto \
+        --permission-mode dontAsk \
         --model haiku \
         --setting-sources project,local \
         --settings $settings_file \
@@ -49,7 +49,7 @@ if {$settings_file ne ""} {
     spawn /Users/guillaume/.local/bin/claude \
         --dangerously-load-development-channels plugin:hermes-channel@claude-channels-hermes \
         --name $session_name \
-        --permission-mode auto \
+        --permission-mode dontAsk \
         --model haiku \
         --allowedTools $allowed_tools
 }
