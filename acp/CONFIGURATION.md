@@ -89,7 +89,12 @@ The `HERMES_SESSION_CWD`. Reference (prod Janet) contains:
 Persona (SOUL.md) + operational instructions (AGENTS.md) + heartbeat/proactive
 (HEARTBEAT.md). Seeded by `hermes_cli/default_soul.py` on first run. **Single
 source of truth for identity** — never duplicate the persona into a launcher's
-`--append-system-prompt`.
+`--append-system-prompt`. That flag carries exactly one thing: the hermes-channel
+reply-delivery protocol (a delivery mechanism, not identity), byte-identical to
+the plugin's MCP server instructions and pinned by
+`acp/src/launcher_reply_protocol.test.ts`. It is there because Claude Code does
+not always hand the plugin's instructions to the model (2026-10-14: no reply
+delivered); when the plugin's `instructions` change, `launcher.exp` must follow.
 
 ## Per-instance access matrix
 

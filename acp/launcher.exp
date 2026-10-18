@@ -60,6 +60,46 @@ set claude_model [expr { [info exists env(HERMES_CLAUDE_MODEL)] && $env(HERMES_C
 # rather than spawning "/.local/bin/claude".
 set claude_bin [expr { [info exists env(HERMES_CLAUDE_BIN)] && $env(HERMES_CLAUDE_BIN) ne "" ? $env(HERMES_CLAUDE_BIN) : ([info exists env(HOME)] && $env(HOME) ne "" ? "$env(HOME)/.local/bin/claude" : "/Users/guillaume/.local/bin/claude") }]
 
+# Reply-delivery protocol, appended to every session's system prompt.
+#
+# The hermes-channel plugin ships the same text as its MCP server instructions,
+# but Claude Code does not always hand them to the model: on 2026-10-14 (claude
+# 2.1.299) a session received the first <channel> message with no
+# mcp_instructions_delta at all, answered in plain text, never called
+# reply_close, and the user got nothing (no Janet reply since 2026-07-27). The
+# zeta launcher avoids this by carrying its reply rule in its own launch; so
+# does this one.
+#
+# This is the DELIVERY MECHANISM only, never persona: identity stays in
+# SOUL.md / the sandbox CLAUDE.md (see CONFIGURATION.md).
+#
+# Must stay byte-identical to the `instructions` array in
+# marketplace/external_plugins/hermes-channel/server.ts. acp/src/
+# launcher_reply_protocol.test.ts runs this launcher against a stub claude and
+# fails on any difference. Brace-quoted so Tcl does no substitution; the text
+# must therefore hold no braces or backslashes, and no "confirm" (the TUI loop
+# below matches that word in the spawn echo, which now includes this text).
+set reply_protocol [string trim {
+MANDATORY: your text/transcript output is NEVER delivered to the user — it is silently discarded. The ONLY way to send a response is calling the reply_close tool. If your turn ends without calling reply_close, the user receives absolutely nothing and your work is lost.
+
+This overrides anything your persona or identity instructions say about answering "directly" or "immediately" or being concise — those describe your TONE, not your delivery mechanism. Answering directly means calling reply_close with your direct answer, not skipping the call.
+
+Inbound prompts arrive as <channel source="hermes" chat_id="..." user="hermes" ts="...">. The chat_id IS the request_id.
+
+Protocol — decide immediately which of these two cases you are in:
+
+CASE A — you can answer without any other tool (this is most turns): your VERY FIRST tool call MUST be reply_close(chat_id, text), with your COMPLETE final answer as text. Do not write your answer as plain text/reasoning first, and do not call any other tool first — compose the whole reply directly inside reply_close's text argument and call it immediately, as your first action this turn. There is no benefit to thinking out loud before it: that output is discarded anyway, and delaying reply_close is the only way this case can go wrong.
+
+CASE B — you genuinely need another tool (Read, Bash, Agent, etc.) to produce the answer: use those tools as needed, then call reply_close(chat_id, text) with your complete final response as your LAST tool call.
+
+MANDATORY: if you launch background/async work (Agent tool, background Bash) and are about to return control while that work keeps running, you MUST still call reply_close before the end of your turn — deliver an interim answer (e.g. "I started X, I will follow up") and report the async results later in a NEW turn when the notification arrives. This is a CASE B turn: the Agent/Bash call is the other tool, reply_close still comes last.
+NEVER leave a turn open waiting for async work: the turn times out and the user receives an empty response.
+
+Advanced (optional): call reply_open(chat_id) first if you want to send progress updates via reply_chunk(handle, text) before the final reply_close(handle, text). Only needed for that case — skip it for the common cases above.
+
+Before you finish this turn, double check: did you call reply_close? If not, do it now — a plain text reply is never seen by anyone. Only reply_close delivers the result.
+}]
+
 cd $session_cwd
 
 if {$settings_file ne ""} {
@@ -70,6 +110,7 @@ if {$settings_file ne ""} {
         --model $claude_model \
         --setting-sources project,local \
         --settings $settings_file \
+        --append-system-prompt $reply_protocol \
         --allowedTools $allowed_tools
 } else {
     spawn $claude_bin \
@@ -77,6 +118,7 @@ if {$settings_file ne ""} {
         --name $session_name \
         --permission-mode dontAsk \
         --model $claude_model \
+        --append-system-prompt $reply_protocol \
         --allowedTools $allowed_tools
 }
 
@@ -93,7 +135,9 @@ if {$settings_file ne ""} {
 #   It only worked when claude booted to the prompt in <1s.
 # - Blind timed sends fail too: boot-to-prompt varies 1-45s with host load.
 # The spawn echo contains "development" but never "confirm", so a bare
-# {confirm} match is safe and fires exactly when a prompt is on screen.
+# {confirm} match is safe and fires exactly when a prompt is on screen. That
+# holds for $reply_protocol too, which is part of the echo: keep it free of the
+# word (launcher_reply_protocol.test.ts fails if it is not).
 set timeout 45
 for {set i 0} {$i < 3} {incr i} {
     expect {
